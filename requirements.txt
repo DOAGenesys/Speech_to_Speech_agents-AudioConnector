@@ -1,10 +1,9 @@
-websockets>=14.0,<15.0
-python-dotenv
+websockets>=14.0,<17.0
+python-dotenv>=1.0.0
 httpx>=0.27.0
-# Gemini SDK
-google-genai>=1.49.0
-# Audio processing libraries for Gemini (PCM resampling)
-librosa>=0.10.0
-soundfile>=0.12.0
-numpy>=1.24.0
+# Gemini Live API SDK (gemini-3.8-live family)
+google-genai>=2.31.0
+# Band-limited streaming resampler for Gemini's 24 kHz output audio
+soxr>=1.0.0
+numpy>=1.26.0
 audioop-lts>=0.2.2; python_version >= '3.13'

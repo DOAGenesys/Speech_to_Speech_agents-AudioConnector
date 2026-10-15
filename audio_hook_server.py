@@ -18,37 +18,50 @@ from config import (
     MAX_AUDIO_BUFFER_SIZE,
     AUDIO_BUFFER_WARNING_THRESHOLD_HIGH,
     AUDIO_BUFFER_WARNING_THRESHOLD_MEDIUM,
-    ENDING_PROMPT,
-    ENDING_TEMPERATURE,
     AI_VENDOR,
-    GEMINI_API_KEY,
-    AI_MODEL,
-    AI_VOICE
+    VENDOR_API_KEY_ENV_NAMES,
+    VENDOR_DEFAULT_MODELS,
+    VENDOR_DEFAULT_VOICES,
+    get_vendor_api_key,
+    model_matches_vendor,
+    normalize_ai_vendor,
 )
 
 from rate_limiter import RateLimiter
 from openai_client import OpenAIRealtimeClient
-from gemini_client import GeminiRealtimeClient
+from gpt_live_client import GptLiveClient, is_gpt_live_model
+from grok_client import GrokRealtimeClient
+from gemini_client import GEMINI_VOICES, GeminiRealtimeClient
 from utils import format_json, parse_iso8601_duration
 from genesys_actions import build_genesys_tool_context
 from mcp_tools import load_mcp_tool_context
 
 from collections import deque
 
+PCMU_BYTES_PER_SECOND = 8000
+DISCONNECT_PLAYBACK_WAIT_SECONDS = 12.0
+SUMMARY_TIMEOUT_SECONDS = 10.0
+CONVERSATION_SUMMARY_PROMPT = (
+    "Please provide a brief, compact summary of this conversation in plain text (2-3 sentences). "
+    "Do not use JSON format, just plain text."
+)
+VENDOR_LABELS = {"openai": "OpenAI", "gemini": "Gemini", "grok": "xAI Grok"}
+VENDOR_MODEL_INPUT_VARS = {"openai": "OPENAI_MODEL", "gemini": "GEMINI_MODEL", "grok": "GROK_MODEL"}
+VENDOR_VOICE_INPUT_VARS = {"openai": "OPENAI_VOICE", "gemini": "GEMINI_VOICE", "grok": "GROK_VOICE"}
+
+
 class AudioHookServer:
     def __init__(self, websocket):
         """
-        Initializes the instance of a class responsible for managing a websocket connection for
-        audio integration, alongside managing state, rate limits, audio buffer, and task scheduling.
-
-        :param websocket: An object representing the websocket connection to manage.
-        :type websocket: any
+        Manages one Genesys AudioHook websocket: protocol state, rate limits, the outbound audio buffer
+        and the speech-to-speech vendor client for the call.
         """
         self.session_id = str(uuid.uuid4())
         self.ws = websocket
         self.client_seq = 0
         self.server_seq = 0
-        self.openai_client = None
+        self.ai_client = None
+        self.ai_vendor = AI_VENDOR
         self.running = True
         self.negotiated_media = None
         self.start_time = time.time()
@@ -66,36 +79,23 @@ class AudioHookServer:
 
         self.audio_buffer = deque(maxlen=MAX_AUDIO_BUFFER_SIZE)
         self.audio_process_task = None
+        self._playback_end_monotonic = 0.0
+        self._disconnecting = False
         self.genesys_tool_context = None
         self.session_outcome = {
             "escalation_required": False,
-            "escalation_reason": ""
+            "escalation_reason": "",
+            "completion_summary": "",
         }
 
         self.logger.info(f"New session started: {self.session_id}")
 
+    # ------------------------------------------------------------------ outbound audio
+
     async def start_audio_processing(self):
-        """
-        Starts the audio processing task asynchronously.
-
-        This method creates an asyncio task to process the audio buffer. It is
-        responsible for initializing and triggering the process that handles
-        the audio data in an asynchronous manner.
-
-        :return: None
-        """
         self.audio_process_task = asyncio.create_task(self._process_audio_buffer())
 
     async def stop_audio_processing(self):
-        """
-        Stops the currently running audio processing task, if there is one.
-
-        This method checks if an audio processing task is active. If active, it cancels
-        the task and awaits its termination. The method handles the case where the task
-        may have been canceled.
-
-        :return: None
-        """
         if self.audio_process_task:
             self.audio_process_task.cancel()
             try:
@@ -106,38 +106,61 @@ class AudioHookServer:
 
     async def _process_audio_buffer(self):
         """
-        Process and send audio frames from the buffer asynchronously. Continuously monitors and sends
-        audio frames from a buffer to a WebSocket connection as fast as the rate limiter allows.
-        Genesys handles audio playback timing based on the PCMU format - we just need to send frames
-        without artificial delays.
-
-        :raises asyncio.CancelledError: If the task is canceled during execution.
-        :raises Exception: If an unexpected error occurs during audio processing.
+        Sends buffered model audio to Genesys as fast as the binary rate limiter allows.
+        Genesys paces playback itself, so frames are not delayed artificially.
         """
         try:
             while self.running:
-                if self.audio_buffer:
-                    if await self.binary_limiter.acquire():
-                        frame_bytes = self.audio_buffer.popleft()
-                        try:
-                            await self.ws.send(frame_bytes)
-                            self.audio_frames_sent += 1
-                            self.logger.debug(
-                                f"Sent audio frame from buffer: {len(frame_bytes)} bytes "
-                                f"(frame #{self.audio_frames_sent}, buffer size: {len(self.audio_buffer)})"
-                            )
-                        except websockets.ConnectionClosed:
-                            self.logger.warning("Genesys WebSocket closed while sending audio frame.")
-                            self.running = False
-                            break
-                    else:
-                        await asyncio.sleep(0.01)
-                else:
+                if self.rate_limit_state["in_backoff"] or not self.audio_buffer:
                     await asyncio.sleep(0.01)
+                    continue
+                if not await self.binary_limiter.acquire():
+                    await asyncio.sleep(0.01)
+                    continue
+                frame_bytes = self.audio_buffer.popleft()
+                try:
+                    await self.ws.send(frame_bytes)
+                except websockets.ConnectionClosed:
+                    self.logger.warning("Genesys WebSocket closed while sending audio frame.")
+                    self.running = False
+                    break
+                self.audio_frames_sent += 1
+                now = time.monotonic()
+                self._playback_end_monotonic = max(now, self._playback_end_monotonic) + len(frame_bytes) / PCMU_BYTES_PER_SECOND
         except asyncio.CancelledError:
             self.logger.info("Audio processing task cancelled")
         except Exception as e:
             self.logger.error(f"Error in audio processing task: {e}", exc_info=True)
+
+    def get_playback_remaining_seconds(self) -> float:
+        """Seconds of model audio the caller has not heard yet (buffered here plus already sent to Genesys)."""
+        buffered = sum(len(frame) for frame in self.audio_buffer) / PCMU_BYTES_PER_SECOND
+        in_flight = max(0.0, self._playback_end_monotonic - time.monotonic())
+        return buffered + in_flight
+
+    def enqueue_ai_audio(self, pcmu_8k: bytes):
+        if not self.running:
+            return
+        if len(self.audio_buffer) >= MAX_AUDIO_BUFFER_SIZE:
+            self.logger.error(
+                f"Audio buffer FULL ({len(self.audio_buffer)} frames), dropping frame - response may be truncated! "
+                f"Consider increasing MAX_AUDIO_BUFFER_SIZE for longer responses."
+            )
+            return
+        self.audio_buffer.append(pcmu_8k)
+        buffer_usage = len(self.audio_buffer) / MAX_AUDIO_BUFFER_SIZE
+        if buffer_usage >= AUDIO_BUFFER_WARNING_THRESHOLD_HIGH:
+            self.logger.warning(
+                f"Audio buffer usage HIGH: {len(self.audio_buffer)}/{MAX_AUDIO_BUFFER_SIZE} frames "
+                f"({buffer_usage*100:.1f}%) - Long response in progress"
+            )
+        elif buffer_usage >= AUDIO_BUFFER_WARNING_THRESHOLD_MEDIUM:
+            self.logger.info(
+                f"Audio buffer usage elevated: {len(self.audio_buffer)}/{MAX_AUDIO_BUFFER_SIZE} frames "
+                f"({buffer_usage*100:.1f}%)"
+            )
+
+    # ------------------------------------------------------------------ Genesys protocol
 
     async def handle_error(self, msg: dict):
         error_code = msg["parameters"].get("code")
@@ -201,12 +224,9 @@ class AudioHookServer:
                     f"Total retries: {self.rate_limit_state['retry_count']}, "
                     f"Duration: {time.time() - self.start_time:.2f}s"
                 )
+                self.rate_limit_state["in_backoff"] = False
                 await self.disconnect_session(reason="error", info="Rate limit max retries exceeded")
                 return False
-
-            if self.openai_client:
-                self.openai_client.running = False
-            self.running = False
 
             session_duration = time.time() - self.start_time
 
@@ -239,10 +259,6 @@ class AudioHookServer:
 
             await asyncio.sleep(used_delay)
 
-            self.running = True
-            if self.openai_client:
-                self.openai_client.running = True
-
             self.rate_limit_state["in_backoff"] = False
             self.logger.info(
                 f"[Rate Limit] Backoff complete, resuming operations. "
@@ -253,11 +269,6 @@ class AudioHookServer:
         return False
 
     async def handle_message(self, msg: dict):
-        """
-        Handle the incoming message from Genesys audio hook server
-        :param msg:
-        :return:
-        """
         msg_type = msg.get("type")
         seq = msg.get("seq", 0)
         self.client_seq = seq
@@ -268,7 +279,6 @@ class AudioHookServer:
 
         if msg_type == "error":
             handled = await self.handle_error(msg)
-            # TODO: If not handled then falls through checking for other types that it cannot be
             if handled:
                 return
 
@@ -282,6 +292,92 @@ class AudioHookServer:
             self.logger.debug(f"Ignoring message of type {msg_type}")
         else:
             self.logger.debug(f"Ignoring unknown message type: {msg_type}")
+
+    def _select_vendor(self, input_vars: dict):
+        """Return (vendor, error). AI_VENDOR in the call's input variables overrides the deployment default."""
+        requested = input_vars.get("AI_VENDOR")
+        if not requested or not str(requested).strip():
+            return AI_VENDOR, None
+        vendor = normalize_ai_vendor(requested)
+        if vendor is None:
+            self.logger.warning(f"Unsupported AI_VENDOR input variable '{requested}'; using default vendor {AI_VENDOR}")
+            return AI_VENDOR, None
+        if not get_vendor_api_key(vendor):
+            return None, f"AI_VENDOR={vendor} requested but {VENDOR_API_KEY_ENV_NAMES[vendor]} is not configured on the server"
+        return vendor, None
+
+    def _select_model(self, vendor: str, input_vars: dict) -> str:
+        candidates = [
+            (VENDOR_MODEL_INPUT_VARS[vendor], input_vars.get(VENDOR_MODEL_INPUT_VARS[vendor])),
+            ("AI_MODEL", input_vars.get("AI_MODEL")),
+        ]
+        if vendor != "openai":
+            # OPENAI_MODEL was the legacy name for AI_MODEL; only honour it when it names a model of this vendor.
+            candidates.append(("OPENAI_MODEL", input_vars.get("OPENAI_MODEL")))
+        for name, value in candidates:
+            if not value or not str(value).strip():
+                continue
+            value = str(value).strip()
+            if model_matches_vendor(vendor, value):
+                return value
+            log = self.logger.debug if name == "OPENAI_MODEL" else self.logger.warning
+            log(f"Ignoring {name}='{value}': it is not a {VENDOR_LABELS[vendor]} model")
+        return VENDOR_DEFAULT_MODELS[vendor]
+
+    def _select_voice(self, vendor: str, input_vars: dict) -> str:
+        voice = None
+        for name in (VENDOR_VOICE_INPUT_VARS[vendor], "AI_VOICE"):
+            value = input_vars.get(name)
+            if value and str(value).strip():
+                voice = str(value).strip()
+                break
+        voice = voice or VENDOR_DEFAULT_VOICES[vendor]
+        if vendor == "gemini":
+            canonical = {name.lower(): name for name in GEMINI_VOICES}.get(voice.lower())
+            if canonical is None:
+                self.logger.warning(f"'{voice}' is not a Gemini Live voice; using {VENDOR_DEFAULT_VOICES['gemini']}")
+                return VENDOR_DEFAULT_VOICES["gemini"]
+            return canonical
+        return voice
+
+    def _create_ai_client(self, vendor: str, model: str):
+        if vendor == "gemini":
+            return GeminiRealtimeClient(
+                self.session_id,
+                api_key=get_vendor_api_key("gemini"),
+                on_speech_started_callback=self.handle_speech_started,
+            )
+        if vendor == "grok":
+            return GrokRealtimeClient(
+                self.session_id,
+                on_speech_started_callback=self.handle_speech_started,
+                api_key=get_vendor_api_key("grok"),
+            )
+        if is_gpt_live_model(model):
+            return GptLiveClient(
+                self.session_id,
+                on_speech_started_callback=self.handle_speech_started,
+                api_key=get_vendor_api_key("openai"),
+            )
+        return OpenAIRealtimeClient(
+            self.session_id,
+            on_speech_started_callback=self.handle_speech_started,
+            api_key=get_vendor_api_key("openai"),
+        )
+
+    async def _send_disconnect_without_session(self, info: str):
+        self.logger.error(info)
+        resp = {
+            "version": "2",
+            "type": "disconnect",
+            "seq": self.server_seq + 1,
+            "clientseq": self.client_seq,
+            "id": self.session_id,
+            "parameters": {"reason": "error", "info": info}
+        }
+        self.server_seq += 1
+        await self._send_json(resp)
+        self.running = False
 
     async def handle_open(self, msg: dict):
         self.session_id = msg["id"]
@@ -316,21 +412,15 @@ class AudioHookServer:
                 break
 
         if not chosen:
-            resp = {
-                "version": "2",
-                "type": "disconnect",
-                "seq": self.server_seq + 1,
-                "clientseq": self.client_seq,
-                "id": self.session_id,
-                "parameters": {
-                    "reason": "error",
-                    "info": "No supported format found"
-                }
-            }
-            self.server_seq += 1
-            await self._send_json(resp)
-            self.running = False
+            await self._send_disconnect_without_session("No supported format found")
             return
+
+        input_vars = msg["parameters"].get("inputVariables", {}) or {}
+        vendor, vendor_error = self._select_vendor(input_vars)
+        if vendor_error:
+            await self._send_disconnect_without_session(vendor_error)
+            return
+        self.ai_vendor = vendor
 
         opened_msg = {
             "version": "2",
@@ -347,18 +437,8 @@ class AudioHookServer:
         await self._send_json(opened_msg)
         self.logger.info(f"Session opened. Negotiated media format: {chosen}")
 
-        input_vars = msg["parameters"].get("inputVariables", {})
-
-        # Vendor-agnostic session variables (use AI_* naming)
-        voice = input_vars.get("AI_VOICE")
-        if not voice:
-            # Fallback to legacy OPENAI_VOICE for backward compatibility
-            voice = input_vars.get("OPENAI_VOICE")
-        if not voice:
-            voice = AI_VOICE  # Use default from config
-
-        # Support vendor-specific voice override for Gemini
-        gemini_voice = input_vars.get("GEMINI_VOICE")
+        model = self._select_model(vendor, input_vars)
+        voice = self._select_voice(vendor, input_vars)
 
         instructions = input_vars.get("AI_SYSTEM_PROMPT")
         if not instructions:
@@ -369,13 +449,6 @@ class AudioHookServer:
         if not temperature:
             # Fallback to legacy OPENAI_TEMPERATURE for backward compatibility
             temperature = input_vars.get("OPENAI_TEMPERATURE")
-
-        model = input_vars.get("AI_MODEL")
-        if not model:
-            # Fallback to legacy OPENAI_MODEL for backward compatibility
-            model = input_vars.get("OPENAI_MODEL")
-        if not model:
-            model = AI_MODEL  # Use default from config
 
         max_output_tokens = input_vars.get("AI_MAX_OUTPUT_TOKENS")
         if not max_output_tokens:
@@ -414,12 +487,10 @@ class AudioHookServer:
         tool_definitions_payload = tool_definitions if tool_definitions else None
         tool_instructions = "\n\n".join(block for block in tool_instruction_blocks if block) if tool_instruction_blocks else None
 
-        self.logger.info(f"Using voice: {voice}")
+        self.logger.info(f"[AI Vendor] {VENDOR_LABELS[vendor]} model={model} voice={voice}")
         self.logger.debug(f"Using instructions: {instructions}")
         if temperature:
             self.logger.debug(f"Using temperature: {temperature}")
-        if model:
-            self.logger.debug(f"Using model: {model}")
         if max_output_tokens:
             if str(max_output_tokens).lower() == 'inf':
                 max_output_tokens = "inf"
@@ -441,91 +512,58 @@ class AudioHookServer:
         if customer_data:
             self.logger.debug("Customer data provided for personalization")
         if escalation_prompt:
-            self.logger.info(f"Using custom ESCALATION_PROMPT: {escalation_prompt}")
+            self.logger.info("Using custom ESCALATION_PROMPT")
         if success_prompt:
-            self.logger.info(f"Using custom SUCCESS_PROMPT: {success_prompt}")
+            self.logger.info("Using custom SUCCESS_PROMPT")
 
         try:
-            # Create the appropriate AI client based on vendor selection
-            if AI_VENDOR == 'gemini':
-                self.logger.info(f"[AI Vendor] Using Gemini Live API")
-                self.openai_client = GeminiRealtimeClient(
-                    self.session_id,
-                    api_key=GEMINI_API_KEY,
-                    on_speech_started_callback=self.handle_speech_started
-                )
-                self.openai_client.language = language
-                self.openai_client.customer_data = customer_data
-                # Set custom farewell prompts if provided
-                self.openai_client.escalation_prompt = escalation_prompt
-                self.openai_client.success_prompt = success_prompt
-                # Wire callbacks for function-calling driven disconnects
-                self.openai_client.on_end_call_request = self._on_end_call_request
-                self.openai_client.on_handoff_request = self._on_handoff_request
-                self.logger.info("[FunctionCall] Gemini callbacks wired: on_end_call_request and on_handoff_request")
-                if self.genesys_tool_context:
-                    self.openai_client.register_genesys_tool_handlers(self.genesys_tool_context.handlers)
+            client = self._create_ai_client(vendor, model)
+            self.ai_client = client
+            client.language = language
+            client.customer_data = customer_data
+            client.escalation_prompt = escalation_prompt
+            client.success_prompt = success_prompt
+            client.on_end_call_request = self._on_end_call_request
+            client.on_handoff_request = self._on_handoff_request
+            client.on_connection_lost = self._on_ai_connection_lost
+            client.playback_remaining_fn = self.get_playback_remaining_seconds
+            if isinstance(client, GrokRealtimeClient):
+                client.set_keyterms(input_vars.get("GROK_KEYTERMS"))
+                if input_vars.get("GROK_REASONING_EFFORT"):
+                    client.reasoning_effort = input_vars.get("GROK_REASONING_EFFORT")
+            if self.genesys_tool_context:
+                client.register_genesys_tool_handlers(self.genesys_tool_context.handlers)
 
-                # Use GEMINI_VOICE if provided, otherwise use AI_VOICE
-                final_voice = gemini_voice if gemini_voice else voice
-
-                await self.openai_client.connect(
-                    instructions=instructions,
-                    voice=final_voice,
-                    temperature=temperature,
-                    model=model,
-                    max_output_tokens=max_output_tokens,
-                    agent_name=agent_name,
-                    company_name=company_name,
-                    tool_definitions=tool_definitions_payload,
-                    tool_instructions=tool_instructions
-                )
-            else:  # AI_VENDOR == 'openai'
-                self.logger.info(f"[AI Vendor] Using OpenAI Realtime API")
-                self.openai_client = OpenAIRealtimeClient(self.session_id, on_speech_started_callback=self.handle_speech_started)
-                self.openai_client.language = language
-                self.openai_client.customer_data = customer_data
-                # Set custom farewell prompts if provided
-                self.openai_client.escalation_prompt = escalation_prompt
-                self.openai_client.success_prompt = success_prompt
-                # Wire callbacks for function-calling driven disconnects
-                self.openai_client.on_end_call_request = self._on_end_call_request
-                self.openai_client.on_handoff_request = self._on_handoff_request
-                self.logger.info("[FunctionCall] OpenAI callbacks wired: on_end_call_request and on_handoff_request")
-                if self.genesys_tool_context:
-                    self.openai_client.register_genesys_tool_handlers(self.genesys_tool_context.handlers)
-                await self.openai_client.connect(
-                    instructions=instructions,
-                    voice=voice,
-                    temperature=temperature,
-                    model=model,
-                    max_output_tokens=max_output_tokens,
-                    agent_name=agent_name,
-                    company_name=company_name,
-                    tool_definitions=tool_definitions_payload,
-                    tool_instructions=tool_instructions
-                )
+            await client.connect(
+                instructions=instructions,
+                voice=voice,
+                temperature=temperature,
+                model=model,
+                max_output_tokens=max_output_tokens,
+                agent_name=agent_name,
+                company_name=company_name,
+                tool_definitions=tool_definitions_payload,
+                tool_instructions=tool_instructions
+            )
         except Exception as e:
             self.logger.error(f"AI client connection failed: {e}")
             await self.disconnect_session(reason="error", info=str(e))
             return
 
-        def on_audio_callback(pcmu_8k: bytes):
-            asyncio.create_task(self.handle_openai_audio(pcmu_8k))
-
         await self.start_audio_processing()
-        await self.openai_client.start_receiving(on_audio_callback)
+        await self.ai_client.start_receiving(self.enqueue_ai_audio)
 
     async def _on_end_call_request(self, reason: str, info: str):
-        self.logger.info(f"[FunctionCall] OpenAI requested end_call. reason={reason}, info={info}")
+        self.logger.info(f"[FunctionCall] Model ended the call. reason={reason}")
         self.session_outcome.update({
             "escalation_required": False,
-            "escalation_reason": ""
+            "escalation_reason": "",
+            "completion_summary": info or "",
         })
         await self.disconnect_session(reason=reason or "completed", info=info or "")
 
     async def _on_handoff_request(self, reason: str, info: str):
-        self.logger.info(f"[FunctionCall] OpenAI requested handoff_to_human. reason={reason}, info={info}")
+        self.logger.info(f"[FunctionCall] Model requested escalation to a human agent. reason={reason}")
         escalation_reason = info or reason or "Customer requested escalation to agent"
         self.session_outcome.update({
             "escalation_required": True,
@@ -533,7 +571,16 @@ class AudioHookServer:
         })
         await self.disconnect_session(reason="completed", info=escalation_reason)
 
+    async def _on_ai_connection_lost(self):
+        if self._disconnecting or not self.running:
+            return
+        label = VENDOR_LABELS.get(self.ai_vendor, self.ai_vendor)
+        self.logger.error(f"{label} connection lost mid-call; disconnecting the session")
+        await self.disconnect_session(reason="error", info=f"{label} connection lost")
+
     async def handle_speech_started(self):
+        self.audio_buffer.clear()
+        self._playback_end_monotonic = time.monotonic()
         event_msg = {
             "version": "2",
             "type": "event",
@@ -552,41 +599,6 @@ class AudioHookServer:
         self.server_seq += 1
         await self._send_json(event_msg)
 
-    async def handle_openai_audio(self, pcmu_8k: bytes):
-        if not self.running:
-            return
-        self.logger.debug(f"Processing OpenAI audio frame: {len(pcmu_8k)} bytes")
-
-        await self.send_binary_to_genesys(pcmu_8k)
-
-    async def send_binary_to_genesys(self, data: bytes):
-        if len(self.audio_buffer) < MAX_AUDIO_BUFFER_SIZE:
-            self.audio_buffer.append(data)
-            
-            buffer_usage = len(self.audio_buffer) / MAX_AUDIO_BUFFER_SIZE
-            
-            if buffer_usage >= AUDIO_BUFFER_WARNING_THRESHOLD_HIGH:
-                self.logger.warning(
-                    f"Audio buffer usage HIGH: {len(self.audio_buffer)}/{MAX_AUDIO_BUFFER_SIZE} frames "
-                    f"({buffer_usage*100:.1f}%) - Long response in progress"
-                )
-            elif buffer_usage >= AUDIO_BUFFER_WARNING_THRESHOLD_MEDIUM:
-                self.logger.info(
-                    f"Audio buffer usage elevated: {len(self.audio_buffer)}/{MAX_AUDIO_BUFFER_SIZE} frames "
-                    f"({buffer_usage*100:.1f}%)"
-                )
-            else:
-                self.logger.debug(
-                    f"Buffered audio frame: {len(data)} bytes "
-                    f"(buffer size: {len(self.audio_buffer)})"
-                )
-        else:
-            self.logger.error(
-                f"Audio buffer FULL ({len(self.audio_buffer)} frames), "
-                f"dropping frame - response may be truncated! "
-                f"Consider increasing MAX_AUDIO_BUFFER_SIZE for longer responses."
-            )
-
     async def handle_ping(self, msg: dict):
         pong_msg = {
             "version": "2",
@@ -603,50 +615,21 @@ class AudioHookServer:
             self.logger.error("Failed to send pong response within timeout")
 
     async def generate_session_summary(self):
-        if not self.openai_client:
+        if not self.ai_client:
             return None
-
         try:
-            # Request a plain text summary (not JSON)
-            plain_text_summary_prompt = "Please provide a brief, compact summary of this conversation in plain text (2-3 sentences). Do not use JSON format, just plain text."
-
-            ending_prompt = {
-                "type": "response.create",
-                "response": {
-                    "conversation": "none",
-                    "output_modalities": ["text"],
-                    "metadata": {"type": "ending_analysis"},
-                    "instructions": plain_text_summary_prompt
-                }
-            }
-
-            await self.openai_client._safe_send(json.dumps(ending_prompt))
-            summary = None
-            try:
-                data = await self.openai_client.await_summary(timeout=10)
-                if data:
-                    summary = data.get("response", {}).get("output", [{}])[0].get("text")
-                # Return the plain text summary as-is
-                if summary:
-                    return summary.strip()
-                else:
-                    return None
-            except asyncio.TimeoutError:
-                self.logger.error("Timeout generating session summary")
-                return None
+            summary = await self.ai_client.generate_summary(CONVERSATION_SUMMARY_PROMPT, timeout=SUMMARY_TIMEOUT_SECONDS)
         except Exception as e:
-            self.logger.error(f"Error generating session summary: {e}")
+            self.logger.error(f"Error generating session summary: {type(e).__name__}: {e}")
             return None
+        return summary.strip() if summary else None
 
     async def handle_close(self, msg: dict):
-        """
-        Update the handle_close method to include summary generation
-        """
         self.logger.info(f"Received 'close' from Genesys. Reason: {msg['parameters'].get('reason')}")
-        # Generate a summary before closing
+        self._disconnecting = True
         summary = await self.generate_session_summary()
         if summary:
-            self.logger.info(f"Session summary: {summary}")
+            self.logger.info("Session summary generated")
 
         closed_msg = {
             "version": "2",
@@ -672,83 +655,67 @@ class AudioHookServer:
         )
 
         await self.stop_audio_processing()
-        if self.openai_client:
-            await self.openai_client.close()
+        if self.ai_client:
+            await self.ai_client.close()
         self.running = False
 
+    async def _wait_for_playback_to_finish(self, max_wait: float):
+        deadline = time.monotonic() + max_wait
+        while time.monotonic() < deadline and self.running:
+            if not self.audio_buffer and self.get_playback_remaining_seconds() <= 0.05:
+                return True
+            await asyncio.sleep(0.1)
+        return not self.audio_buffer
 
     async def disconnect_session(self, reason="completed", info=""):
+        if self._disconnecting:
+            return
+        self._disconnecting = True
         try:
             if not self.session_id:
                 return
 
-            self.logger.info(f"[FunctionCall] Initiating server-side disconnect. reason={reason}, info={info}")
+            self.logger.info(f"[FunctionCall] Initiating server-side disconnect. reason={reason}")
 
-            # Wait for audio buffer to drain (send all farewell audio to Genesys before disconnecting)
-            max_wait_seconds = 10
+            # The summary runs while the farewell finishes playing so the caller does not wait for both.
+            summary_task = asyncio.create_task(self.generate_session_summary()) if self.ai_client else None
+
             wait_start = time.time()
-            while len(self.audio_buffer) > 0 and (time.time() - wait_start) < max_wait_seconds:
-                buffer_size = len(self.audio_buffer)
-                self.logger.debug(f"[FunctionCall] Waiting for audio buffer to drain: {buffer_size} frames remaining")
-                await asyncio.sleep(0.1)
-            
-            if len(self.audio_buffer) > 0:
-                self.logger.warning(f"[FunctionCall] Audio buffer still has {len(self.audio_buffer)} frames after {max_wait_seconds}s wait - proceeding with disconnect")
+            drained = await self._wait_for_playback_to_finish(DISCONNECT_PLAYBACK_WAIT_SECONDS)
+            if drained:
+                self.logger.info(f"[FunctionCall] Farewell playback finished after {time.time() - wait_start:.2f}s")
             else:
-                self.logger.info(f"[FunctionCall] Audio buffer drained successfully after {time.time() - wait_start:.2f}s")
+                self.logger.warning(
+                    f"[FunctionCall] Audio buffer still has {len(self.audio_buffer)} frames after "
+                    f"{DISCONNECT_PLAYBACK_WAIT_SECONDS}s wait - proceeding with disconnect"
+                )
 
-            # Stop audio processing to prevent sending frames after disconnect
             self.running = False
             await self.stop_audio_processing()
-            self.logger.info(f"[FunctionCall] Audio processing stopped")
 
-            # Always generate conversation summary as plain text (required for CONVERSATION_SUMMARY output variable)
-            summary_data = None
-            if self.openai_client:
-                self.logger.info(f"[FunctionCall] Generating conversation summary before disconnect")
-                summary_data = await self.generate_session_summary()
-            
-            # Close OpenAI connection after summary (if generated) and audio buffer has drained
-            if self.openai_client:
-                self.logger.info(f"[FunctionCall] Closing OpenAI connection")
-                await self.openai_client.close()
+            summary_data = await summary_task if summary_task else None
 
-            # Get token usage from AI client (vendor-agnostic)
             token_metrics = {}
-            if self.openai_client:
-                # Check if this is a Gemini client (has get_token_metrics method)
-                if hasattr(self.openai_client, 'get_token_metrics'):
-                    # Gemini client
-                    token_metrics = self.openai_client.get_token_metrics()
-                    self.logger.info(f"[FunctionCall] Token usage (Gemini): {token_metrics}")
-                elif hasattr(self.openai_client, 'cumulative_tokens'):
-                    # OpenAI client - use cumulative tokens tracked across all responses
-                    cumulative = self.openai_client.cumulative_tokens
-                    token_metrics = {
-                        "TOTAL_INPUT_TEXT_TOKENS": str(cumulative.get("input_text_tokens", 0)),
-                        "TOTAL_INPUT_CACHED_TEXT_TOKENS": str(cumulative.get("input_cached_text_tokens", 0)),
-                        "TOTAL_INPUT_AUDIO_TOKENS": str(cumulative.get("input_audio_tokens", 0)),
-                        "TOTAL_INPUT_CACHED_AUDIO_TOKENS": str(cumulative.get("input_cached_audio_tokens", 0)),
-                        "TOTAL_OUTPUT_TEXT_TOKENS": str(cumulative.get("output_text_tokens", 0)),
-                        "TOTAL_OUTPUT_AUDIO_TOKENS": str(cumulative.get("output_audio_tokens", 0))
-                    }
-                    self.logger.info(f"[FunctionCall] Token usage (OpenAI): {token_metrics}")
+            if self.ai_client:
+                await self.ai_client.close()
+                token_metrics = self.ai_client.get_token_metrics()
+                self.logger.info(f"[FunctionCall] Token usage ({VENDOR_LABELS.get(self.ai_vendor)}): {token_metrics}")
 
-            # Build output variables - ensure all are always populated
             outcome = self.session_outcome or {}
             output_vars = {
                 "CONVERSATION_SUMMARY": summary_data if summary_data else "",
                 "CONVERSATION_DURATION": str(time.time() - self.start_time),
                 "ESCALATION_REQUIRED": "true" if outcome.get("escalation_required") else "false",
                 "ESCALATION_REASON": outcome.get("escalation_reason", ""),
-                # Add token metrics (will be populated if available, otherwise defaults to "0")
-                "TOTAL_INPUT_TEXT_TOKENS": token_metrics.get("TOTAL_INPUT_TEXT_TOKENS", "0"),
-                "TOTAL_INPUT_CACHED_TEXT_TOKENS": token_metrics.get("TOTAL_INPUT_CACHED_TEXT_TOKENS", "0"),
-                "TOTAL_INPUT_AUDIO_TOKENS": token_metrics.get("TOTAL_INPUT_AUDIO_TOKENS", "0"),
-                "TOTAL_INPUT_CACHED_AUDIO_TOKENS": token_metrics.get("TOTAL_INPUT_CACHED_AUDIO_TOKENS", "0"),
-                "TOTAL_OUTPUT_TEXT_TOKENS": token_metrics.get("TOTAL_OUTPUT_TEXT_TOKENS", "0"),
-                "TOTAL_OUTPUT_AUDIO_TOKENS": token_metrics.get("TOTAL_OUTPUT_AUDIO_TOKENS", "0")
+                "COMPLETION_SUMMARY": outcome.get("completion_summary", ""),
+                "TOTAL_INPUT_TEXT_TOKENS": "0",
+                "TOTAL_INPUT_CACHED_TEXT_TOKENS": "0",
+                "TOTAL_INPUT_AUDIO_TOKENS": "0",
+                "TOTAL_INPUT_CACHED_AUDIO_TOKENS": "0",
+                "TOTAL_OUTPUT_TEXT_TOKENS": "0",
+                "TOTAL_OUTPUT_AUDIO_TOKENS": "0",
             }
+            output_vars.update(token_metrics)
 
             disconnect_msg = {
                 "version": "2",
@@ -771,46 +738,23 @@ class AudioHookServer:
                 await asyncio.wait_for(self.ws.wait_closed(), timeout=5.0)
                 self.logger.info(f"[FunctionCall] Genesys acknowledged disconnect for session {self.session_id}")
             except asyncio.TimeoutError:
-                logger.warning(f"[FunctionCall] Timeout waiting for Genesys to acknowledge disconnect for session {self.session_id}")
+                self.logger.warning(f"[FunctionCall] Timeout waiting for Genesys to acknowledge disconnect for session {self.session_id}")
         except Exception as e:
-            logger.error(f"[FunctionCall] Error in disconnect_session: {e}", exc_info=True)
-            # Ensure cleanup happens even on error
+            self.logger.error(f"[FunctionCall] Error in disconnect_session: {e}", exc_info=True)
             self.running = False
             await self.stop_audio_processing()
-            if self.openai_client:
+            if self.ai_client:
                 try:
-                    await self.openai_client.close()
+                    await self.ai_client.close()
                 except Exception:
                     pass
 
     async def handle_audio_frame(self, frame_bytes: bytes):
-        """
-        Processes an incoming audio frame and sends it to the OpenAI client for processing
-        if the OpenAI client is available and running.
-
-        If the OpenAI client is not available or not running, the function returns
-        immediately without processing the frame. The method increments the frame
-        counter upon receiving a frame and logs the amount of data received.
-
-        The method performs asynchronous communication with the OpenAI client to
-        deliver the processed audio frame for real-time analysis.
-
-        :param frame_bytes: Audio frame data in bytes.
-        :type frame_bytes: bytes
-        :return: None
-        :rtype: None
-        """
-        # TODO: Refactor to use and on both tests
-        # TODO: self.openai_client and self.openai_client.running:
-        if not self.openai_client or not self.openai_client.running:
+        """Forwards one caller audio frame (PCMU 8 kHz) from Genesys to the AI vendor client."""
+        if not self.ai_client or not self.ai_client.running or self.rate_limit_state["in_backoff"]:
             return
-
-        # Increment counter to keep track of frames sent
         self.audio_frames_received += 1
-        self.logger.debug(f"Received audio frame from Genesys: {len(frame_bytes)} bytes (frame #{self.audio_frames_received})")
-
-        # Send audio frame to OpenAI client real-time model
-        await self.openai_client.send_audio(frame_bytes)
+        await self.ai_client.send_audio(frame_bytes)
 
     async def _send_json(self, msg: dict):
         try:

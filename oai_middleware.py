@@ -1,4 +1,5 @@
 import asyncio
+import hmac
 import json
 import uuid
 import logging
@@ -19,7 +20,9 @@ from config import (
     logger,
     LOG_FILE,
     DEBUG,
-    GENESYS_API_KEY
+    GENESYS_API_KEY,
+    AI_VENDOR,
+    AI_MODEL,
 )
 
 from audio_hook_server import AudioHookServer
@@ -133,7 +136,7 @@ async def validate_request(path_or_connection, headers_or_request):
         logger.error("[HTTP] Connection rejected - Missing 'x-api-key' header.")
         return _build_response(http.HTTPStatus.UNAUTHORIZED, "Missing 'x-api-key' header\n")
 
-    if incoming_api_key != GENESYS_API_KEY:
+    if not hmac.compare_digest(incoming_api_key.encode("utf-8"), GENESYS_API_KEY.encode("utf-8")):
         logger.error("[HTTP] Connection rejected - Invalid API Key.")
         return _build_response(http.HTTPStatus.UNAUTHORIZED, "Invalid API Key\n")
 
@@ -243,15 +246,18 @@ async def handle_genesys_connection(websocket):
                         await session.disconnect_session("error", f"Message processing error: {e}")
 
             except websockets.ConnectionClosed as e:
-                logger.info(f"[WS-{connection_id}] Connection closed: code={e.code}, reason={e.reason}")
+                close_frame = getattr(e, "rcvd", None)
+                close_code = close_frame.code if close_frame else None
+                close_reason = close_frame.reason if close_frame else ""
+                logger.info(f"[WS-{connection_id}] Connection closed: code={close_code}, reason={close_reason}")
                 break
             except Exception as e:
                 logger.error(f"[WS-{connection_id}] Unexpected error: {e}", exc_info=True)
                 break
 
         logger.info(f"[WS-{connection_id}] Session loop ended, cleaning up")
-        if session and session.openai_client:
-            await session.openai_client.close()
+        if session and session.ai_client:
+            await session.ai_client.close()
         logger.info(f"[WS-{connection_id}] Session cleanup complete")
 
     except Exception as e:
@@ -268,7 +274,8 @@ async def main():
     
     startup_msg = f"""
 {'='*80}
-Genesys-OpenAI Bridging Server
+Genesys AudioHook Speech-to-Speech Bridge (OpenAI / Gemini / xAI Grok)
+Default vendor: {AI_VENDOR} ({AI_MODEL})
 Starting up at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 Host: {host}
 Port: {port}

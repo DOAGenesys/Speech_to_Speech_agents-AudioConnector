@@ -3,6 +3,7 @@ import logging
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 from dotenv import load_dotenv
 
 
@@ -43,62 +44,129 @@ GENESYS_PCMU_SILENCE_BYTE = 0xFF
 # Server settings
 GENESYS_PATH = "/audiohook"
 
-# AI Vendor selection (openai or gemini)
-_ai_vendor = os.getenv('AI_VENDOR')
-_ai_provider = os.getenv('AI_PROVIDER')  # legacy name used by earlier modules
+# --- AI vendor selection ---
+SUPPORTED_AI_VENDORS = ("openai", "gemini", "grok")
+_AI_VENDOR_ALIASES = {"xai": "grok", "google": "gemini"}
 
-if _ai_provider and not _ai_vendor:
-    # allow older deployments that still set AI_PROVIDER
-    _ai_vendor = _ai_provider
 
-AI_VENDOR = (_ai_vendor or 'openai').lower()
+def normalize_ai_vendor(value: Optional[str]) -> Optional[str]:
+    """Return the canonical vendor name for ``value`` or None when it is not supported."""
+    if not value or not str(value).strip():
+        return None
+    vendor = str(value).strip().lower()
+    vendor = _AI_VENDOR_ALIASES.get(vendor, vendor)
+    return vendor if vendor in SUPPORTED_AI_VENDORS else None
 
-if AI_VENDOR not in ('openai', 'gemini'):
-    raise ValueError(f"AI_VENDOR must be 'openai' or 'gemini', got '{AI_VENDOR}'")
 
-# Alias for compatibility with provider abstraction layer
+# AI_PROVIDER is the legacy name used by earlier deployments.
+_ai_vendor_raw = os.getenv('AI_VENDOR') or os.getenv('AI_PROVIDER') or 'openai'
+AI_VENDOR = normalize_ai_vendor(_ai_vendor_raw)
+if AI_VENDOR is None:
+    raise ValueError(f"AI_VENDOR must be one of {', '.join(SUPPORTED_AI_VENDORS)} (or 'xai'), got '{_ai_vendor_raw}'")
+
 AI_PROVIDER = AI_VENDOR
 
 # Vendor-specific API keys
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
+XAI_API_KEY = os.getenv('XAI_API_KEY')
 
-# Validate that the appropriate API key is set for the selected vendor
-if AI_VENDOR == 'openai' and not OPENAI_API_KEY:
-    raise ValueError("OPENAI_API_KEY not found in environment variables but AI_VENDOR is set to 'openai'.")
-elif AI_VENDOR == 'gemini' and not GEMINI_API_KEY:
-    raise ValueError("GEMINI_API_KEY not found in environment variables but AI_VENDOR is set to 'gemini'.")
+VENDOR_API_KEY_ENV_NAMES = {
+    "openai": "OPENAI_API_KEY",
+    "gemini": "GEMINI_API_KEY",
+    "grok": "XAI_API_KEY",
+}
 
-# Common AI settings (vendor-agnostic)
-AI_MODEL = os.getenv('AI_MODEL')
-if not AI_MODEL:
-    # Set default based on vendor
-    if AI_VENDOR == 'openai':
-        AI_MODEL = "gpt-realtime-mini"
-    else:  # gemini
-        AI_MODEL = "gemini-2.5-flash-native-audio-preview-09-2025"
 
-AI_VOICE = os.getenv('AI_VOICE')
-if not AI_VOICE:
-    # Set default based on vendor
-    if AI_VENDOR == 'openai':
-        AI_VOICE = "sage"
-    else:  # gemini
-        AI_VOICE = "Kore"
+def get_vendor_api_key(vendor: str) -> Optional[str]:
+    return {"openai": OPENAI_API_KEY, "gemini": GEMINI_API_KEY, "grok": XAI_API_KEY}.get(vendor)
+
+
+if not get_vendor_api_key(AI_VENDOR):
+    raise ValueError(
+        f"{VENDOR_API_KEY_ENV_NAMES[AI_VENDOR]} not found in environment variables but AI_VENDOR is set to '{AI_VENDOR}'."
+    )
+
+# --- Models and voices ---
+# Each vendor has its own default so a flow can switch vendors per call (AI_VENDOR session variable).
+# The legacy AI_MODEL / AI_VOICE environment variables override the default vendor only.
+OPENAI_MODEL = os.getenv('OPENAI_MODEL') or "gpt-realtime-2.1"
+GEMINI_MODEL = os.getenv('GEMINI_MODEL') or "gemini-3.8-live"
+GROK_MODEL = os.getenv('GROK_MODEL') or "grok-voice-3.0"
+
+OPENAI_VOICE = os.getenv('OPENAI_VOICE') or "marin"
+GEMINI_VOICE = os.getenv('GEMINI_VOICE') or "Kore"
+GROK_VOICE = os.getenv('GROK_VOICE') or "eve"
+
+VENDOR_DEFAULT_MODELS = {"openai": OPENAI_MODEL, "gemini": GEMINI_MODEL, "grok": GROK_MODEL}
+VENDOR_DEFAULT_VOICES = {"openai": OPENAI_VOICE, "gemini": GEMINI_VOICE, "grok": GROK_VOICE}
+if os.getenv('AI_MODEL'):
+    VENDOR_DEFAULT_MODELS[AI_VENDOR] = os.getenv('AI_MODEL')
+if os.getenv('AI_VOICE'):
+    VENDOR_DEFAULT_VOICES[AI_VENDOR] = os.getenv('AI_VOICE')
+
+AI_MODEL = VENDOR_DEFAULT_MODELS[AI_VENDOR]
+AI_VOICE = VENDOR_DEFAULT_VOICES[AI_VENDOR]
+
+_VENDOR_MODEL_PREFIXES = {
+    "openai": ("gpt-",),
+    "gemini": ("gemini-", "models/gemini-"),
+    "grok": ("grok-",),
+}
+
+
+def model_matches_vendor(vendor: str, model: Optional[str]) -> bool:
+    if not model:
+        return False
+    return model.strip().lower().startswith(_VENDOR_MODEL_PREFIXES.get(vendor, ()))
+
 
 DEFAULT_AGENT_NAME = os.getenv('AGENT_NAME', 'AI Assistant')
 DEFAULT_COMPANY_NAME = os.getenv('COMPANY_NAME', 'Our Company')
 
-# OpenAI-specific settings
-OPENAI_REALTIME_URL = f"wss://api.openai.com/v1/realtime?model={AI_MODEL}"
+# --- OpenAI Realtime (gpt-realtime-*) ---
+OPENAI_REALTIME_BASE_URL = os.getenv('OPENAI_REALTIME_BASE_URL', 'wss://api.openai.com/v1/realtime')
+# reasoning.effort for reasoning Realtime models (gpt-realtime-2*): minimal | low | medium | high | xhigh
+OPENAI_REASONING_EFFORT = os.getenv('OPENAI_REASONING_EFFORT', 'low')
+# semantic_vad | server_vad
+OPENAI_TURN_DETECTION = os.getenv('OPENAI_TURN_DETECTION', 'semantic_vad')
+# semantic_vad eagerness: auto | low | medium | high
+OPENAI_VAD_EAGERNESS = os.getenv('OPENAI_VAD_EAGERNESS', 'auto')
+# near_field | far_field; unset leaves noise reduction off
+OPENAI_NOISE_REDUCTION = os.getenv('OPENAI_NOISE_REDUCTION')
 
-# Gemini-specific settings
-GEMINI_MODEL = os.getenv('GEMINI_MODEL', 'gemini-2.5-flash-native-audio-preview-09-2025')
+# --- OpenAI GPT-Live (gpt-live-*) ---
+OPENAI_API_BASE_URL = os.getenv('OPENAI_API_BASE_URL', 'https://api.openai.com/v1')
+OPENAI_LIVE_URL = os.getenv('OPENAI_LIVE_URL', 'wss://api.openai.com/v1/live/sessions')
+OPENAI_LIVE_DELEGATION_MODEL = os.getenv('OPENAI_LIVE_DELEGATION_MODEL', 'gpt-6-luna')
+OPENAI_LIVE_DELEGATION_REASONING_EFFORT = os.getenv('OPENAI_LIVE_DELEGATION_REASONING_EFFORT')
+# "priority" selects Fast mode for the delegated Responses backend when available.
+OPENAI_LIVE_SERVICE_TIER = os.getenv('OPENAI_LIVE_SERVICE_TIER')
+
+# --- Google Gemini Live ---
 GEMINI_BASE_URL = os.getenv('GEMINI_BASE_URL', 'generativelanguage.googleapis.com')
-GEMINI_API_VERSION = os.getenv('GEMINI_API_VERSION', 'v1alpha')
+GEMINI_API_VERSION = os.getenv('GEMINI_API_VERSION', 'v1beta')
+# thinking_level for models that accept it (gemini-3.8-live-extended-thinking, gemini-3.1-flash-live-preview).
+# gemini-3.8-live rejects thinking_config, so it is never sent for that model.
+GEMINI_THINKING_LEVEL = os.getenv('GEMINI_THINKING_LEVEL')
+GEMINI_VAD_SILENCE_DURATION_MS = int(os.getenv('GEMINI_VAD_SILENCE_DURATION_MS', '700'))
+GEMINI_VAD_PREFIX_PADDING_MS = int(os.getenv('GEMINI_VAD_PREFIX_PADDING_MS', '100'))
+# high | low; unset uses the server default
+GEMINI_VAD_START_SENSITIVITY = os.getenv('GEMINI_VAD_START_SENSITIVITY')
+GEMINI_VAD_END_SENSITIVITY = os.getenv('GEMINI_VAD_END_SENSITIVITY')
+GEMINI_CONTEXT_COMPRESSION = _str_to_bool(os.getenv('GEMINI_CONTEXT_COMPRESSION', 'true'))
+GEMINI_SESSION_RESUMPTION = _str_to_bool(os.getenv('GEMINI_SESSION_RESUMPTION', 'true'))
+GEMINI_GOOGLE_SEARCH = _str_to_bool(os.getenv('GEMINI_GOOGLE_SEARCH', 'false'))
+# Text model that turns the call transcript into the end-of-call summary (Live models answer in audio only).
+GEMINI_SUMMARY_MODEL = os.getenv('GEMINI_SUMMARY_MODEL', 'gemini-3.5-flash-lite')
 
-# Legacy compatibility
-AI_PROVIDER = AI_VENDOR  # Alias for backward compatibility
+# --- xAI Grok Voice ---
+XAI_REALTIME_BASE_URL = os.getenv('XAI_REALTIME_BASE_URL', 'wss://api.x.ai/v1/realtime')
+# high | none; unset uses the API default (high)
+GROK_REASONING_EFFORT = os.getenv('GROK_REASONING_EFFORT')
+GROK_IDLE_TIMEOUT_MS = os.getenv('GROK_IDLE_TIMEOUT_MS')
+GROK_SPEECH_SPEED = os.getenv('GROK_SPEECH_SPEED')
+GROK_KEYTERMS = os.getenv('GROK_KEYTERMS')
 
 DEFAULT_TEMPERATURE = 0.8
 DEFAULT_MAX_OUTPUT_TOKENS = "inf"
@@ -199,8 +267,6 @@ GENESYS_RATE_WINDOW = 1.0            # Rate limit window in seconds
 
 LOG_FILE = "logging.txt"
 
-# Gemini diagnostics
-GEMINI_DIAGNOSTICS_SUMMARY = _str_to_bool(os.getenv('GEMINI_DIAGNOSTICS_SUMMARY', 'false'))
 LOGGING_FORMAT = "%(asctime)s.%(msecs)03d [%(levelname)s] %(name)s: %(message)s"
 
 
@@ -239,21 +305,9 @@ logging.basicConfig(
 logger = logging.getLogger("GenesysOpenAIBridge")
 logger.setLevel(root_log_level)
 
-# Suppress verbose numba logging (used by librosa for JIT compilation)
-# Numba generates excessive debug output that clutters logs
-numba_logger = logging.getLogger('numba')
-numba_logger.setLevel(logging.ERROR)
-
-if DEBUG != 'true':
-    # Suppress numba debug logs
-    logging.getLogger('numba').setLevel(logging.WARNING)
-    # Suppress librosa debug logs
-    logging.getLogger('librosa').setLevel(logging.WARNING)
-    # Keep websockets at INFO level
-    logging.getLogger('websockets').setLevel(logging.INFO)
-else:
-    # In DEBUG mode, keep websockets at INFO to avoid excessive logs
-    logging.getLogger('websockets').setLevel(logging.INFO)
+# Client libraries log handshake/request headers (vendor API keys) at DEBUG, so they stay at INFO even when DEBUG=true.
+for _library_logger_name in ('websockets', 'httpx', 'httpcore', 'google_genai'):
+    logging.getLogger(_library_logger_name).setLevel(logging.INFO)
 
 # Drop noisy websockets.server log entries for routine HTTP health checks
 websockets_server_logger = logging.getLogger('websockets.server')

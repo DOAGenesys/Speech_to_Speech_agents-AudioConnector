@@ -1,13 +1,23 @@
 import json
 import audioop
 import re
-import array
+from typing import Callable, Optional
+
+try:
+    import numpy as np
+    import soxr
+except ImportError:
+    np = None
+    soxr = None
 
 from config import (
     MASTER_SYSTEM_PROMPT,
     LANGUAGE_SYSTEM_PROMPT,
+    GENESYS_PCMU_FRAME_SIZE,
+    GENESYS_PCMU_SILENCE_BYTE,
     logger
 )
+from call_control import CALL_CONTROL_GUIDANCE
 
 def is_websocket_open(ws) -> bool:
     """
@@ -186,15 +196,10 @@ def extract_request_headers(connection, request):
 
 def get_websocket_connect_kwargs(url, headers, **other_kwargs):
     """
-    Build version-agnostic kwargs for websockets.connect().
-    Works across different websockets library versions.
+    Build kwargs for websockets.connect() that work with both client implementations.
 
-    WEBSOCKETS VERSION COMPATIBILITY:
-    - websockets < 15.0: Uses 'additional_headers' parameter
-    - websockets >= 15.0: Uses 'extra_headers' parameter (additional_headers was removed)
-
-    This function detects the websockets version by checking the connect() signature
-    and returns the appropriate kwargs dict.
+    - websockets >= 14 (asyncio implementation, the default ``websockets.connect``): ``additional_headers``
+    - legacy client (websockets <= 13 default, ``websockets.legacy``): ``extra_headers``
 
     :param url: WebSocket URL to connect to
     :param headers: Dict of headers to include in the connection
@@ -204,87 +209,141 @@ def get_websocket_connect_kwargs(url, headers, **other_kwargs):
     import inspect
     import websockets
 
-    # Start with the URL and other kwargs
     kwargs = {"uri": url}
     kwargs.update(other_kwargs)
 
-    # Detect which header parameter name to use by inspecting the connect signature
     try:
-        sig = inspect.signature(websockets.connect)
-        param_names = list(sig.parameters.keys())
-
-        if 'extra_headers' in param_names:
-            # websockets >= 15.0
-            kwargs['extra_headers'] = headers
-        elif 'additional_headers' in param_names:
-            # websockets < 15.0
-            kwargs['additional_headers'] = headers
-        else:
-            # Unknown version, try extra_headers as it's the newer standard
-            logger.warning("Could not detect websockets header parameter, using 'extra_headers'")
-            kwargs['extra_headers'] = headers
-    except Exception as e:
-        # If inspection fails, default to extra_headers (newer standard)
-        logger.warning(f"Error detecting websockets version: {e}, defaulting to 'extra_headers'")
-        kwargs['extra_headers'] = headers
-
+        param_names = inspect.signature(websockets.connect).parameters
+    except (TypeError, ValueError):
+        param_names = {}
+    header_param = "extra_headers" if "extra_headers" in param_names and "additional_headers" not in param_names else "additional_headers"
+    kwargs[header_param] = headers
     return kwargs
 
-def decode_pcmu_to_pcm16(ulaw_bytes: bytes) -> bytes:
-    return audioop.ulaw2lin(ulaw_bytes, 2)
-
-def encode_pcm16_to_pcmu(pcm16_bytes: bytes) -> bytes:
-    return audioop.lin2ulaw(pcm16_bytes, 2)
-
-def resample_audio(audio_bytes: bytes, from_rate: int, to_rate: int, sample_width: int = 2) -> bytes:
+class Pcm16Resampler:
     """
-    Resample audio from one sample rate to another.
+    Streaming mono PCM16 resampler that keeps filter state across chunks.
 
-    :param audio_bytes: Input audio data
-    :param from_rate: Source sample rate (Hz)
-    :param to_rate: Target sample rate (Hz)
-    :param sample_width: Sample width in bytes (default: 2 for PCM16)
-    :return: Resampled audio bytes
+    Uses soxr (band-limited, no aliasing when downsampling 24 kHz model audio to 8 kHz telephony)
+    and falls back to audioop.ratecv when soxr is not installed.
     """
-    if from_rate == to_rate:
-        return audio_bytes
-    return audioop.ratecv(audio_bytes, sample_width, 1, from_rate, to_rate, None)[0]
 
-def pcmu_8k_to_pcm16_16k(pcmu_8k_bytes: bytes) -> bytes:
-    """
-    Convert PCMU 8kHz (Genesys format) to PCM16 16kHz (Gemini input format).
+    def __init__(self, in_rate: int, out_rate: int):
+        self.in_rate = in_rate
+        self.out_rate = out_rate
+        self._pending_byte = b""
+        self._ratecv_state = None
+        self._stream = None
+        if in_rate != out_rate and soxr is not None:
+            self._stream = soxr.ResampleStream(in_rate, out_rate, 1, dtype="int16")
 
-    :param pcmu_8k_bytes: PCMU audio at 8kHz
-    :return: PCM16 audio at 16kHz
-    """
-    # Step 1: Decode PCMU to PCM16 @ 8kHz
-    pcm16_8k = decode_pcmu_to_pcm16(pcmu_8k_bytes)
+    def process(self, pcm16: bytes, last: bool = False) -> bytes:
+        data = self._pending_byte + (pcm16 or b"")
+        usable = len(data) - (len(data) % 2)
+        self._pending_byte = data[usable:]
+        data = data[:usable]
+        if self.in_rate == self.out_rate:
+            return data
+        if self._stream is not None:
+            if not data and not last:
+                return b""
+            samples = np.frombuffer(data, dtype="<i2")
+            return self._stream.resample_chunk(samples, last=last).astype("<i2").tobytes()
+        if not data:
+            return b""
+        out, self._ratecv_state = audioop.ratecv(data, 2, 1, self.in_rate, self.out_rate, self._ratecv_state)
+        return out
 
-    # Step 2: Resample from 8kHz to 16kHz
-    pcm16_16k = resample_audio(pcm16_8k, 8000, 16000, 2)
+    def reset(self):
+        self._pending_byte = b""
+        self._ratecv_state = None
+        if self._stream is not None:
+            self._stream.clear()
 
-    return pcm16_16k
 
-def pcm16_24k_to_pcmu_8k(pcm16_24k_bytes: bytes) -> bytes:
-    """
-    Convert PCM16 24kHz (Gemini output format) to PCMU 8kHz (Genesys format).
+class PcmuFrameAssembler:
+    """Re-frames an arbitrary PCMU byte stream into fixed-size Genesys AudioHook frames."""
 
-    :param pcm16_24k_bytes: PCM16 audio at 24kHz
-    :return: PCMU audio at 8kHz
-    """
-    # Step 1: Resample from 24kHz to 8kHz
-    pcm16_8k = resample_audio(pcm16_24k_bytes, 24000, 8000, 2)
+    def __init__(
+        self,
+        emit: Callable[[bytes], None],
+        frame_size: int = GENESYS_PCMU_FRAME_SIZE,
+        silence_byte: int = GENESYS_PCMU_SILENCE_BYTE,
+    ):
+        self._emit = emit
+        self._frame_size = frame_size
+        self._silence = bytes([silence_byte])
+        self._buffer = bytearray()
 
-    # Step 2: Encode PCM16 to PCMU
-    pcmu_8k = encode_pcm16_to_pcmu(pcm16_8k)
+    def push(self, pcmu: bytes):
+        if pcmu:
+            self._buffer.extend(pcmu)
+        while len(self._buffer) >= self._frame_size:
+            frame = bytes(self._buffer[:self._frame_size])
+            del self._buffer[:self._frame_size]
+            self._emit(frame)
 
-    return pcmu_8k
+    def flush(self):
+        """Emit any partial frame padded with silence (call at the end of each spoken response)."""
+        if not self._buffer:
+            return
+        self._buffer.extend(self._silence * (self._frame_size - len(self._buffer)))
+        frame = bytes(self._buffer)
+        self._buffer.clear()
+        self._emit(frame)
+
+    def clear(self):
+        self._buffer.clear()
+
+    @property
+    def pending_bytes(self) -> int:
+        return len(self._buffer)
+
+
+class TokenUsage:
+    """Cumulative token counters reported to Genesys as TOTAL_* output variables."""
+
+    FIELDS = (
+        "input_text_tokens",
+        "input_cached_text_tokens",
+        "input_audio_tokens",
+        "input_cached_audio_tokens",
+        "output_text_tokens",
+        "output_audio_tokens",
+    )
+
+    def __init__(self):
+        self.totals = dict.fromkeys(self.FIELDS, 0)
+
+    def add(self, **counts):
+        for name, value in counts.items():
+            try:
+                self.totals[name] += int(value or 0)
+            except (TypeError, ValueError):
+                continue
+
+    def as_output_variables(self) -> dict:
+        return {f"TOTAL_{name.upper()}": str(value) for name, value in self.totals.items()}
+
+
+_BCP47_TAG = re.compile(r"^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})*$")
+
+
+def as_bcp47_language_tag(value: Optional[str]) -> Optional[str]:
+    """Return ``value`` when it looks like a BCP-47 tag (``es``, ``pt-BR``), otherwise None (e.g. ``Spanish``)."""
+    if not value:
+        return None
+    candidate = value.strip()
+    return candidate if _BCP47_TAG.match(candidate) else None
+
 
 def format_json(obj: dict) -> str:
     return json.dumps(obj, indent=2)
 
-def create_final_system_prompt(admin_prompt, language=None, customer_data=None, agent_name=None, company_name=None):
+def create_final_system_prompt(admin_prompt, language=None, customer_data=None, agent_name=None, company_name=None,
+                               call_control_guidance=CALL_CONTROL_GUIDANCE):
     base_prompt = LANGUAGE_SYSTEM_PROMPT.format(language=language) if language else MASTER_SYSTEM_PROMPT
+    admin_prompt = admin_prompt or "You are a helpful assistant."
 
     if agent_name:
         admin_prompt = admin_prompt.replace("[AGENT_NAME]", agent_name)
@@ -308,9 +367,9 @@ def create_final_system_prompt(admin_prompt, language=None, customer_data=None, 
                     customer_instructions += f"{key}: {value}\n"
                 customer_instructions += "Use this customer data to personalize the conversation when relevant."
         except Exception as e:
-            logger.warning(f"Error parsing customer data: {e}")
+            logger.warning(f"Error parsing customer data: {type(e).__name__}")
 
-    return f"""[TIER 1 - MASTER INSTRUCTIONS - HIGHEST PRIORITY]
+    prompt = f"""[TIER 1 - MASTER INSTRUCTIONS - HIGHEST PRIORITY]
 {base_prompt}
 
 [TIER 2 - ADMIN INSTRUCTIONS]
@@ -319,12 +378,10 @@ def create_final_system_prompt(admin_prompt, language=None, customer_data=None, 
 [HIERARCHY ENFORCEMENT]
 In case of any conflict between Tier 1 and Tier 2 instructions, Tier 1 (Master) instructions 
 MUST ALWAYS take precedence and override any conflicting Tier 2 instructions.
-
-[TOOL USAGE - CALL MANAGEMENT]
-- If the user indicates they are done or asks to end, CALL `end_call` with a concise `reason` and optional `note`. Examples: "please end the call", "that's all", "goodbye".
-- If the user asks for a human/agent/representative/supervisor, CALL `handoff_to_human` with a `reason` and, if known, a `department`. Examples: "transfer me to a human", "talk to a representative".
-- Prefer these tool calls over verbal confirmations for these intents. A short farewell response will be sent after the tool call output is processed.
 """
+    if call_control_guidance:
+        prompt += f"\n{call_control_guidance}\n"
+    return prompt
 
 def parse_iso8601_duration(duration_str: str) -> float:
     match = re.match(r'P(?:(\d+)D)?T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?', duration_str)

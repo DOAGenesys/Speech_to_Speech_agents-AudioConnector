@@ -1,516 +1,452 @@
 # Genesys Cloud Real-Time Voice AI Connector
 
-A real-time voice connector that bridges Genesys Cloud Audio Connector with leading AI providers (OpenAI Realtime API and Google Gemini Live API), enabling intelligent voice agent assisted interactions with live phone calls through speech-to-speech processing.
+Connect Genesys Cloud phone calls to a speech-to-speech AI voice agent. The connector is a small Python WebSocket server: Genesys Cloud streams the caller's audio to it through the **Audio Connector** (AudioHook), the connector relays it to the AI model you choose, and plays the model's spoken answer back to the caller.
 
-## Overview
+Supported AI vendors:
 
-This application serves as a WebSocket middleware that captures audio from Genesys Cloud phone calls, processes it through your chosen AI vendor's real-time API (OpenAI or Gemini), and streams intelligent responses back to callers in real-time. Designed for cloud deployment on platforms like DigitalOcean App Platform.
+| Vendor | Default model | Other models you can use |
+|--------|---------------|--------------------------|
+| **OpenAI Realtime** | `gpt-realtime-2.1` | `gpt-realtime-2.1-mini`, `gpt-realtime-2`, `gpt-realtime` |
+| **OpenAI GPT-Live** | `gpt-live-1` | (tools run on `gpt-6-luna`, configurable) |
+| **Google Gemini Live** | `gemini-3.8-live` | `gemini-3.8-live-extended-thinking`, `gemini-3.1-flash-live-preview` |
+| **xAI Grok Voice** | `grok-voice-3.0` | `grok-voice-latest` |
 
-## Features
+You pick a default vendor for the server, and each call can switch vendor from the Architect flow.
 
-- **Multi-Vendor AI Support**: Choose between OpenAI Realtime API and Google Gemini Live API based on your needs
-- **Real-Time Speech Processing**: Direct speech-to-speech communication without traditional STT/TTS pipeline
-- **Dynamic AI Configuration**: Customize AI behavior through Genesys Architect variables (system prompt, model, voice, temperature)
-- **Intelligent Conversation Management**: Context-aware responses with built-in Voice Activity Detection (VAD) for natural conversation flow
-- **Long Response Support**: Adaptive audio buffering handles 3-minute continuous AI responses without truncation—perfect for detailed explanations, complex lookups, and multi-step function calls
-- **Autonomous Call Termination**: AI can autonomously end calls when users indicate they're done or request human escalation using function calling
-- **Genesys Data Actions**: Dynamically expose approved Genesys Cloud Data Actions as AI tools so the voice agent can run secure CRM/data lookups in real time
-- **Robust Error Handling**: Rate limiting and exponential backoff for stable API interaction
-- **Cloud-Ready Architecture**: Optimized for modern cloud platforms with automated SSL and scaling support
+**What the voice agent can do**
 
-## How It Works
+- Talk naturally with the caller, including interruptions (barge-in).
+- Look up and update data by calling your **Genesys Cloud Data Actions** (and, optionally, remote MCP servers or web search).
+- End the call by itself, either because the request is solved or because a human agent is needed, and tell Architect which one happened so the flow can route the call.
+- Return a call summary and usage metrics to Architect when the call ends.
 
-1. **Connection Establishment**: Genesys Cloud AudioHook initiates WebSocket connection to the server
-2. **Audio Streaming**: Real-time call audio streams in PCMU/ULAW format
-3. **AI Processing**: Audio forwarded to your selected AI vendor's real-time API (OpenAI or Gemini) using specified model
-4. **Response Generation**: AI vendor processes audio and generates synthesized voice response
-5. **Audio Playback**: Synthesized audio streams back through Genesys to caller
-6. **Autonomous Call Management**: When appropriate, AI invokes call-control functions (`end_conversation_successfully` or `end_conversation_with_escalation`) and generates a farewell message
-7. **Graceful Disconnect**: After farewell audio completes and buffer drains, connector sends disconnect message to Genesys with session outcome data (escalation status, completion summary, token metrics)
-8. **Architect Flow Routing**: Architect uses output variables (`ESCALATION_REQUIRED`, `ESCALATION_REASON`, `COMPLETION_SUMMARY`) to route the call appropriately (queue transfer, wrap-up, etc.)
+## Contents
 
-### Audio Format Handling
+1. [How it works](#how-it-works)
+2. [Where to host it](#where-to-host-it)
+3. [Quick start (local)](#quick-start-local)
+4. [Deploy to DigitalOcean App Platform](#deploy-to-digitalocean-app-platform)
+5. [Connect Genesys Cloud](#connect-genesys-cloud)
+6. [Environment variables](#environment-variables)
+7. [Session variables (Architect)](#session-variables-architect)
+8. [Ending calls and escalating](#ending-calls-and-escalating)
+9. [Genesys Data Actions as tools](#genesys-data-actions-as-tools)
+10. [MCP servers and web search](#mcp-servers-and-web-search)
+11. [Choosing a vendor](#choosing-a-vendor)
+12. [Vendor details](#vendor-details)
+13. [Testing](#testing)
+14. [Troubleshooting](#troubleshooting)
+15. [Project structure](#project-structure)
 
-The connector automatically handles audio format conversion for both providers:
-- **Genesys**: PCMU (μ-law) @ 8kHz
-- **OpenAI**: PCMU @ 8kHz (native support, no conversion needed)
-- **Gemini**: PCM16 @ 16kHz input, PCM16 @ 24kHz output (automatic conversion)
+## How it works
 
-## Prerequisites
-
-- Python 3.9 or higher
-- Genesys Cloud account with AudioHook integration enabled
-- **One of the following AI vendor credentials:**
-  - **OpenAI**: API key with Real-Time API access
-  - **Gemini**: Google AI API key with Gemini Live API access
-- Cloud deployment platform (DigitalOcean recommended)
-
-## Configuration
-
-### AI Vendor Selection
-
-The connector supports both OpenAI and Gemini AI vendors. Select your vendor using the `AI_VENDOR` environment variable:
-
-```bash
-AI_VENDOR=openai  # Use OpenAI Realtime API (default)
-# or
-AI_VENDOR=gemini  # Use Google Gemini Live API
+```
+Caller ──► Genesys Cloud ──(Audio Connector / WebSocket)──► this connector ──(WebSocket)──► OpenAI / Gemini / Grok
+       ◄──                ◄──                               ◄──                            ◄──
 ```
 
-### Common AI Settings (Vendor-Agnostic)
+1. A call reaches the **Call Audio Connector** action in your Architect flow. Genesys opens a WebSocket to the connector and sends the flow's session variables (prompt, vendor, model, voice, tools...).
+2. The connector checks the `x-api-key` header, opens a session with the chosen AI vendor and starts streaming audio in both directions (G.711 µ-law, 8 kHz).
+3. The model listens, answers, and calls tools when it needs data.
+4. When the conversation is over, the model calls one of two built-in functions: `end_conversation_successfully` or `end_conversation_with_escalation`. The connector lets the farewell finish playing, then disconnects.
+5. Architect receives output variables (`ESCALATION_REQUIRED`, `CONVERSATION_SUMMARY`, ...) and continues the flow, for example by transferring to a queue.
 
-These settings work with both OpenAI and Gemini:
+## Where to host it
 
-| Variable | Description | Required |
-|----------|-------------|----------|
-| `AI_MODEL` | AI model to use | No (defaults based on `AI_VENDOR`) |
-| `AI_VOICE` | Voice for speech synthesis | No (defaults based on `AI_VENDOR`) |
+**Use DigitalOcean App Platform** (the deployment this project is built and documented for), or any host that runs a long-lived Python process with a public `wss://` endpoint, such as a container service or a VM behind a TLS proxy.
 
-**Default Models:**
-- OpenAI: `gpt-realtime-mini`, `gpt-realtime`
-- Gemini: `gemini-2.5-flash-native-audio-preview-09-2025`
+**Vercel is not a good fit.** Genesys keeps one WebSocket open to the connector for the whole call, and the connector keeps another WebSocket open to the AI vendor. Vercel Functions are request/response functions with execution time limits and cannot act as a long-lived WebSocket server, so the connector cannot run there.
 
-**Default Voices:**
-- OpenAI: `sage` (options: `alloy`, `ash`, `ballad`, `coral`, `echo`, `sage`, `shimmer`, `verse`)
-- Gemini: `Kore` (options: `Kore`, `Puck`, `Charon`, `Aoede`, `Fenrir`, `Orbit`, and more)
+## Quick start (local)
 
-### Vendor-Specific Configuration
+**You need:**
 
-#### OpenAI
+- Python 3.10 or newer (the repo pins 3.12 in `.python-version`).
+- An API key for at least one vendor: [OpenAI](https://platform.openai.com/api-keys), [Google AI Studio](https://aistudio.google.com/apikey) (Gemini) or [xAI](https://console.x.ai/).
+- A Genesys Cloud org with the Audio Connector integration available.
 
-| Variable | Description | Required |
-|----------|-------------|----------|
-| `OPENAI_API_KEY` | Your OpenAI API key | Yes (when `AI_VENDOR=openai`) |
+**Steps:**
 
-See https://platform.openai.com/docs/guides/realtime-conversations#voice-options for updated OpenAI voice availability.
+1. Install the dependencies:
 
-#### Gemini
+   ```bash
+   python -m venv .venv
+   # Windows: .venv\Scripts\activate    macOS/Linux: source .venv/bin/activate
+   pip install -r requirements.txt
+   ```
 
-| Variable | Description | Required |
-|----------|-------------|----------|
-| `GEMINI_API_KEY` | Your Google AI API key | Yes (when `AI_VENDOR=gemini`) |
+2. Create your configuration file from the template and fill in your own values:
 
-Gemini Live API automatically selects voices based on the language.
+   ```bash
+   cp .env.local.example .env      # Windows PowerShell: Copy-Item .env.local.example .env
+   ```
 
-See https://ai.google.dev/gemini-api/docs/speech-generation#voices for the complete list of available Gemini voices.
+   At minimum set `GENESYS_API_KEY` (any long random string; you will paste the same value into Genesys), `AI_VENDOR`, and the API key of that vendor. `.env` is gitignored: never commit it.
 
-#### Genesys Data Action Environment Variables
+3. Start the server:
 
-Set the following variables when you want the voice agent to call Genesys Cloud Data Actions as part of its function-calling toolkit:
+   ```bash
+   python oai_middleware.py
+   ```
 
-| Variable | Description | Required |
-|----------|-------------|----------|
-| `GENESYS_CLIENT_ID` / `GENESYS_CLIENT_SECRET` | OAuth client credentials with permission to run the desired data actions. | Yes (when enabled) |
-| `GENESYS_REGION` or `GENESYS_BASE_URL` | Region slug (e.g., `usw2.pure.cloud`) or full API base URL. Determines which Genesys org to call. | Yes (when enabled) |
-| `GENESYS_LOGIN_URL` | Optional override for the OAuth login URL. Defaults to `https://login.<region>.mypurecloud.com`. | No |
-| `GENESYS_ALLOWED_DATA_ACTION_IDS` | Optional comma-separated allowlist enforced server-side. Only IDs in this list are exposed even if the flow requests others. | No |
-| `GENESYS_MAX_TOOLS_PER_SESSION` | Caps how many data actions are loaded as tools for a single call (default `10`). | No |
-| `GENESYS_MAX_ACTION_CALLS_PER_SESSION` | Limits how many data action invocations the LLM can perform before we block additional calls (default `10`). | No |
-| `GENESYS_TOOL_OUTPUT_REDACTION_FIELDS` | Comma-separated JSON paths (e.g., `customer.ssn,account.cardNumber`) that are redacted before returning tool output to the model. | No |
+   It listens on `ws://0.0.0.0:8080/audiohook` (change the port with `PORT`). Opening `http://localhost:8080/` in a browser returns `OK`.
 
-Advanced tuning variables (`GENESYS_HTTP_TIMEOUT_SECONDS`, retry/backoff knobs, etc.) are also available in `config.py` for production hardening.
+4. Optional: run the offline tests (no API keys or network needed): `python tests/smoke_test_vendors.py`.
 
-#### Audio Buffering Configuration
+Genesys Cloud can only reach a public `wss://` URL. For a local trial, expose port 8080 with a tunnel such as ngrok or Cloudflare Tunnel; for real use, deploy it as described below.
 
-The connector uses an adaptive audio buffering system to handle long AI responses without truncation:
+## Deploy to DigitalOcean App Platform
 
-| Setting | Value | Purpose |
-|---------|-------|---------|
-| `MAX_AUDIO_BUFFER_SIZE` | 1200 frames | Supports ~180 seconds (3 minutes) of continuous audio buffering |
-| `AUDIO_BUFFER_WARNING_THRESHOLD_MEDIUM` | 75% | Logs INFO when buffer usage exceeds 75% |
-| `AUDIO_BUFFER_WARNING_THRESHOLD_HIGH` | 90% | Logs WARNING when buffer usage exceeds 90% |
+### 1. Create a DigitalOcean account
 
-**How it works:**
-- OpenAI Realtime API sends audio faster than real-time playback speed (per OpenAI documentation)
-- The buffer stores incoming frames while respecting Genesys rate limits (10 frames/sec sustained, conservative)
-- This prevents audio truncation during long responses (e.g., detailed ticket information, complex explanations)
-- Memory usage is minimal (~1.92 MB at full capacity)
-- Conservative rate limiting prevents 429 errors and ensures stable connections
-
-**Log messages you may see:**
-- **DEBUG**: Normal operation (buffer < 75%)
-- **INFO**: Elevated usage, likely a longer response in progress (buffer 75-90%)
-- **WARNING**: High usage, extended response (buffer 90%+)
-- **ERROR**: Buffer full with dropped frame (should be extremely rare; indicates need for larger buffer)
-
-No configuration required—the system automatically handles responses of any length up to 3 minutes.
-
-#### Remote MCP Tooling
-
-The connector can also expose remote [Model Context Protocol (MCP)](https://platform.openai.com/docs/guides/tools-remote-mcp) servers and OpenAI built-in tools to the Realtime session so the voice agent can call them directly.
-
-1. In Architect, set the **`MCP_TOOLS_JSON` input variable** to a JSON array string. Each entry must follow the OpenAI Realtime spec (e.g., `{"type":"mcp","server_label":"deepwiki","server_url":"https://mcp.deepwiki.com/mcp","require_approval":"never"}` or `{ "type": "web_search_preview" }`). Leave the variable blank to disable MCP for that call.
-2. On session start we parse that string, append clear guidance to the system instructions (reminding the model to use `mcp.list_tools`/`mcp_call` events), and register the tools alongside the default call-control and Genesys Data Action functions.
-3. The OpenAI client emits structured logs for every `response.mcp_call*` and `mcp_list_tools*` event so MCP activity can be monitored in production.
-
-Because the entries are passed straight through to OpenAI, you can add new MCP servers or built-in tools without code changes—just update the Architect variable and redeploy your flow if needed.
-
-## Deployment
-
-### DigitalOcean App Platform
-
-#### Step 1: DigitalOcean account creation
-
-If you don't have already one, you can get a DigitalOcean account with 200$ in free credits here (and also, you will be helping my R&D efforts!):
+If you don't have one yet, you can get a DigitalOcean account with $200 in free credits here (this also supports my R&D work):
 
 <a href="https://www.digitalocean.com/?refcode=e78e0ec0ec1d&utm_campaign=Referral_Invite&utm_medium=Referral_Program&utm_source=badge"><img src="https://web-platforms.sfo2.cdn.digitaloceanspaces.com/WWW/Badge%201.svg" alt="DigitalOcean Referral Badge" /></a>
 
-#### Step 2: Create DigitalOcean App
+### 2. Create the app
 
-1. Navigate to DigitalOcean Apps section
-2. Click **Create App** and select your repository
-3. Define you server specs (for testing purposes you can just select the 5$/month cheapest option)
+1. Fork or push this repository to your own GitHub account.
+2. In DigitalOcean, open **Apps** → **Create App** and select your repository.
+3. Choose an instance size. The smallest ($5/month) is enough for testing.
 
-#### Step 3: Configure Environment Variables
+### 3. Add the environment variables
 
-**Provider Selection (Required):**
+Add these in the app settings. Mark every key and secret as **Encrypted**.
 
-| Variable | Description | Example Value |
-|----------|-------------|---------------|
-| `AI_VENDOR` | AI provider to use (`openai` or `gemini`) | `openai` or `gemini` |
-| `OPENAI_API_KEY` | Your OpenAI API key (required if `AI_VENDOR=openai`) | `sk-...` |
-| `GEMINI_API_KEY` | Your Google AI API key (required if `AI_VENDOR=gemini`) | Your Gemini API key |
-| `GENESYS_API_KEY` | Shared secret from Genesys Audio Connector integration | Your generated API key |
-| `GENESYS_CLIENT_ID` | OAuth client ID for Genesys Cloud API access | Your OAuth client ID |
-| `GENESYS_CLIENT_SECRET` | OAuth client secret for Genesys Cloud API access | Your OAuth client secret |
-| `GENESYS_REGION` | Your Genesys Cloud region | `mypurecloud.com` |
+| Variable | Value |
+|----------|-------|
+| `GENESYS_API_KEY` | A long random string. You will enter the same value in the Genesys integration |
+| `AI_VENDOR` | `openai`, `gemini` or `grok` (the default vendor for every call) |
+| `OPENAI_API_KEY` | Your OpenAI key, if you use OpenAI |
+| `GEMINI_API_KEY` | Your Google AI Studio key, if you use Gemini |
+| `XAI_API_KEY` | Your xAI key, if you use Grok |
 
-**Optional Environment Variables:**
+Only the keys of the vendors you use are needed. If you use Genesys Data Actions as tools, also add `GENESYS_CLIENT_ID`, `GENESYS_CLIENT_SECRET` and `GENESYS_REGION` (see [Genesys Data Actions as tools](#genesys-data-actions-as-tools)). Everything else is optional; see [Environment variables](#environment-variables).
 
-| Variable | Description | Default Value |
-|----------|-------------|---------------|
-| `AI_MODEL` | AI model to use (works with both vendors) | Vendor-specific default |
-| `AI_VOICE` | Voice for speech synthesis (works with both vendors) | Vendor-specific default |
-| `DEBUG` | Enable debug logging | `false` |
+Make sure the instance size, environment variables, region and name are set, then click **Create App**:
 
-**Important**:
-- Mark all sensitive variables (API keys, secrets) as **encrypted secrets** in DigitalOcean
-- `DEBUG` defaults to `false` if not set (production mode)
-- Set `AI_VENDOR` to choose between OpenAI and Gemini
-- Only the API key for your selected vendor is required
+<img width="976" height="1159" alt="Create App summary" src="https://github.com/user-attachments/assets/7a87e31d-6766-4279-aee0-956e26dc23e4" />
 
-#### Step 4: Deploy
+### 4. Set the run command and health check
 
-- Make sure the instance size, the environment variables, the region and the name are correctly set, and proceed ("Create App"):
+In the component **Settings**, set the **Run Command** to `python oai_middleware.py`. Without it the deployment fails:
 
-<img width="976" height="1159" alt="image" src="https://github.com/user-attachments/assets/7a87e31d-6766-4279-aee0-956e26dc23e4" />
+<img width="898" height="1185" alt="Run command setting" src="https://github.com/user-attachments/assets/778872e3-315c-4995-af44-5f7284d95ad8" />
 
-#### Step 5: Run command
+Use these health check settings (the server answers `OK` on `/`):
 
-- The Run command ("python oai_middleware.py") must be set in "Settings", otherwise the deployment will fail:
+<img width="561" height="680" alt="Health check settings" src="https://github.com/user-attachments/assets/433d9dc4-da03-4c2f-b2fe-13a367326ca0" />
 
-<img width="898" height="1185" alt="image" src="https://github.com/user-attachments/assets/778872e3-315c-4995-af44-5f7284d95ad8" />
+### 5. Note your app URL
 
-- Use these Health Settings:
+After the deployment finishes, copy the app URL (for example `https://your-app-xxxxx.ondigitalocean.app`). DigitalOcean provides the TLS certificate.
 
-  <img width="561" height="680" alt="image" src="https://github.com/user-attachments/assets/433d9dc4-da03-4c2f-b2fe-13a367326ca0" />
+<img width="1438" height="320" alt="App URL" src="https://github.com/user-attachments/assets/df49e434-3d1f-4870-8cf8-e9770e886415" />
 
+## Connect Genesys Cloud
 
-- Once the app is deployed, note your deployment URL (e.g., `https://your-app-xxxxx.ondigitalocean.app`):
-  
+### 1. Create the Audio Connector integration
 
-<img width="1438" height="320" alt="image" src="https://github.com/user-attachments/assets/df49e434-3d1f-4870-8cf8-e9770e886415" />
+1. In Genesys Cloud, go to **Admin → Integrations**, add an **Audio Connector** integration.
+2. Set the base connection URI to `wss://<your-app-domain>/audiohook` (for DigitalOcean: `wss://your-app-xxxxx.ondigitalocean.app/audiohook`).
+3. Set the API key credential to your `GENESYS_API_KEY` value.
+4. Save and activate the integration.
 
+### 2. Build the Architect flow
 
+Create an inbound call flow with a **Call Audio Connector** action that uses the integration:
 
-## Genesys Cloud Setup
+<img width="504" height="769" alt="Architect flow example" src="https://github.com/user-attachments/assets/ce5efcf3-a031-41d9-9281-bcfb0e3e83f5" />
 
-### Audio Connector Integration
+To start faster, import the example flow in this repo (`DO - Audio Connector - OAI_v16-0.i3InboundFlow`). Then:
 
-1. Create new Audio Connector integration
-2. Configure WebSocket endpoint: `wss://<your-app-domain>.ondigitalocean.app/audiohook`
-3. Set API Key header with your `GENESYS_API_KEY` value
-4. Save and activate integration
+1. In the Call Audio Connector action, set the session variables you need, at least `AI_SYSTEM_PROMPT` (see [Session variables](#session-variables-architect)).
+2. If the agent should use Data Actions, set `DATA_ACTION_IDS` and `DATA_ACTION_DESCRIPTIONS`.
+3. Adapt the instruction and guardrail prompts in the flow (they are concatenated into the system prompt sent to the AI vendor).
+4. After the action, branch on `ESCALATION_REQUIRED` to transfer to a queue or end the call.
 
-### Architect Flow Configuration
+Call the flow's number: you should hear the voice agent.
 
-Create an inbound call flow with the Call Audio Connector action referencing your integration. Example:
+## Environment variables
 
-<img width="504" height="769" alt="image" src="https://github.com/user-attachments/assets/ce5efcf3-a031-41d9-9281-bcfb0e3e83f5" />
+These are set on the server (`.env` locally, app settings in DigitalOcean). [`.env.local.example`](.env.local.example) lists them all with placeholder values.
 
+### Required
 
-You can import the inbound call flow in this repo (DO - Audio Connector - OAI_v16-0.i3InboundFlow) and use it as a starting point. You will still have to configure all the session variables in the "Call Audio Connector" action, including these two fundamental session variables: DATA_ACTION_IDS and DATA_ACTION_DESCRIPTIONS (see `Session Variables` and `Genesys Data Action Tools` sections below), which will determine agentic tool usage. Also, modify the instruction and guardrail prompts (which are concatenated to form the final system prompt that is sent to OpenAI) according to your use cases.
+| Variable | Description |
+|----------|-------------|
+| `GENESYS_API_KEY` | Shared secret that Genesys sends in the `x-api-key` header. Connections with a different key are rejected |
+| `AI_VENDOR` | Default vendor: `openai` (default), `gemini` or `grok` (`xai` also works) |
+| `OPENAI_API_KEY` / `GEMINI_API_KEY` / `XAI_API_KEY` | API key of each vendor you use |
 
-## Session Variables
+The server refuses to start if the key of the default `AI_VENDOR` is missing. If a call asks for a vendor whose key is not configured, the call is disconnected with an error that names the missing variable.
 
-### Input Variables (Architect → Connector)
+### Models and voices
 
-Configure AI behavior by setting these variables before the Call Audio Connector action:
+| Variable | Default | Options |
+|----------|---------|---------|
+| `OPENAI_MODEL` | `gpt-realtime-2.1` | Any `gpt-realtime*` model, or `gpt-live-1` to use GPT-Live |
+| `OPENAI_VOICE` | `marin` | `cedar` and the other OpenAI Realtime voices |
+| `GEMINI_MODEL` | `gemini-3.8-live` | `gemini-3.8-live-extended-thinking`, `gemini-3.1-flash-live-preview` |
+| `GEMINI_VOICE` | `Kore` | 30 voices such as `Puck`, `Charon`, `Zephyr`, `Aoede` ([full list](https://ai.google.dev/gemini-api/docs/speech-generation#voices)) |
+| `GROK_MODEL` | `grok-voice-3.0` | `grok-voice-latest` |
+| `GROK_VOICE` | `eve` | `ara`, `leo`, `rex`, `sal`, `atlas`, ... (`GET https://api.x.ai/v1/tts/voices`) or a custom voice ID |
+| `AI_MODEL` / `AI_VOICE` | not set | Older names; they override the model / voice of the default vendor only |
 
-| Variable Name | Description | Default Value |
-|---------------|-------------|---------------|
-| `AI_SYSTEM_PROMPT` | AI assistant instructions | "You are a helpful assistant." |
-| `AI_VOICE` | Voice selection (vendor-agnostic, see options above) | Vendor default |
-| `AI_MODEL` | AI model to use (overrides environment variable) | Uses `AI_MODEL` env var |
-| `AI_TEMPERATURE` | Response creativity/randomness (0.0-2.0 for Gemini, 0.6-1.2 for OpenAI) | 0.8 |
-| `AI_MAX_OUTPUT_TOKENS` | Maximum tokens in response (may be ignored by some models) | "inf" |
-| `LANGUAGE` | Response language override | Not set |
-| `CUSTOMER_DATA` | Personalization data (semicolon-separated key:value pairs) | Not set |
-| `AGENT_NAME` | AI assistant name for prompts | "AI Assistant" |
-| `COMPANY_NAME` | Company name for prompts | "Our Company" |
-| `SUCCESS_PROMPT` | Custom farewell message for successful call completion (exact words the AI will say when ending successfully) | Not set (uses default farewell) |
-| `ESCALATION_PROMPT` | Custom transfer message for escalation to human agent (exact words the AI will say when escalating) | Not set (uses default transfer message) |
-| `DATA_ACTION_IDS` | Comma/pipe separated Genesys Data Action IDs to expose as realtime tools | Not set |
-| `DATA_ACTION_DESCRIPTIONS` | Pipe-delimited descriptions aligned with `DATA_ACTION_IDS` order | Not set |
-| `MCP_TOOLS_JSON` | JSON array (as a string) describing MCP/built-in tools to expose. Leave blank to disable. | Not set |
+### Optional tuning
 
-**Legacy Variable Support:** For backward compatibility, the connector also supports the legacy `OPENAI_*` prefixed session variables (`OPENAI_SYSTEM_PROMPT`, `OPENAI_VOICE`, `OPENAI_MODEL`, `OPENAI_TEMPERATURE`, `OPENAI_MAX_OUTPUT_TOKENS`). These will be automatically mapped to their `AI_*` equivalents.
+| Variable | Applies to | What it does |
+|----------|-----------|--------------|
+| `OPENAI_REASONING_EFFORT` | OpenAI Realtime | `minimal`, `low` (default), `medium`, `high`, `xhigh`. Used by the `gpt-realtime-2*` models only |
+| `OPENAI_TURN_DETECTION` | OpenAI Realtime | `semantic_vad` (default) or `server_vad` |
+| `OPENAI_VAD_EAGERNESS` | OpenAI Realtime | `auto` (default), `low`, `medium`, `high` |
+| `OPENAI_NOISE_REDUCTION` | OpenAI Realtime | `near_field` or `far_field` (off by default) |
+| `OPENAI_LIVE_DELEGATION_MODEL` | GPT-Live | Model that runs tools and reasoning behind GPT-Live (default `gpt-6-luna`) |
+| `OPENAI_LIVE_DELEGATION_REASONING_EFFORT` | GPT-Live | Reasoning effort of that model |
+| `OPENAI_LIVE_SERVICE_TIER` | GPT-Live | `auto`, `default`, `flex` or `priority` |
+| `GEMINI_THINKING_LEVEL` | Gemini | `low` / `medium` / `high` for extended-thinking, `minimal`..`high` for 3.1 flash live. Ignored by `gemini-3.8-live` |
+| `GEMINI_VAD_SILENCE_DURATION_MS` | Gemini | Silence that ends the caller's turn (default `700`) |
+| `GEMINI_VAD_PREFIX_PADDING_MS` | Gemini | Speech needed before a turn starts (default `100`) |
+| `GEMINI_VAD_START_SENSITIVITY` / `GEMINI_VAD_END_SENSITIVITY` | Gemini | `high` or `low` |
+| `GEMINI_CONTEXT_COMPRESSION` | Gemini | Keeps calls longer than 15 minutes working (default `true`) |
+| `GEMINI_SESSION_RESUMPTION` | Gemini | Reconnects automatically when Google resets the connection (default `true`) |
+| `GEMINI_GOOGLE_SEARCH` | Gemini | Lets the model use Google Search on every call (default `false`) |
+| `GEMINI_SUMMARY_MODEL` | Gemini | Text model that writes the call summary (default `gemini-3.5-flash-lite`) |
+| `GROK_REASONING_EFFORT` | Grok | `high` (default) or `none` for the fastest answers |
+| `GROK_IDLE_TIMEOUT_MS` | Grok | Prompt a silent caller again after this many milliseconds |
+| `GROK_SPEECH_SPEED` | Grok | Speaking speed from `0.7` to `1.5` |
+| `GROK_KEYTERMS` | Grok | Comma-separated names and product terms to improve speech recognition (max 100) |
+| `AGENT_NAME` / `COMPANY_NAME` | All | Default persona names used in the prompt (`AI Assistant` / `Our Company`) |
+| `PORT` | All | Listening port (default `8080`) |
+| `DEBUG` | All | `true` for debug logs. Debug logs contain prompts and summaries, so keep it `false` in production |
 
-### Output Variables (Connector → Architect)
+### Genesys Data Actions (optional)
 
-These variables are returned when the session ends:
+Needed only when the voice agent calls Genesys Cloud Data Actions:
 
-| Variable Name | Description |
-|---------------|-------------|
-| `CONVERSATION_SUMMARY` | JSON-structured call summary (topics, decisions, sentiment) |
-| `CONVERSATION_DURATION` | AudioHook session duration in seconds |
-| `TOTAL_INPUT_TEXT_TOKENS` | Text tokens sent to the AI vendor |
-| `TOTAL_INPUT_CACHED_TEXT_TOKENS` | Cached text tokens sent to the AI vendor |
-| `TOTAL_INPUT_AUDIO_TOKENS` | Audio tokens sent to the AI vendor |
-| `TOTAL_INPUT_CACHED_AUDIO_TOKENS` | Cached audio tokens sent to the AI vendor |
-| `TOTAL_OUTPUT_TEXT_TOKENS` | Text tokens received from the AI vendor |
-| `TOTAL_OUTPUT_AUDIO_TOKENS` | Audio tokens received from the AI vendor |
-| `ESCALATION_REQUIRED` | `true` when the agent requested a human handoff, else `false` |
-| `ESCALATION_REASON` | Explanation captured from the `end_conversation_with_escalation` call |
-| `COMPLETION_SUMMARY` | Short summary provided via `end_conversation_successfully` |
+| Variable | Description |
+|----------|-------------|
+| `GENESYS_CLIENT_ID` / `GENESYS_CLIENT_SECRET` | OAuth client credentials (client credentials grant) allowed to run the data actions |
+| `GENESYS_REGION` or `GENESYS_BASE_URL` | Your region (for example `mypurecloud.com`, `usw2.pure.cloud`) or the full API base URL |
+| `GENESYS_LOGIN_URL` | Override for the OAuth login URL (default `https://login.<region>`) |
+| `GENESYS_ALLOWED_DATA_ACTION_IDS` | Comma-separated allowlist. Only these actions can be exposed, whatever the flow requests |
+| `GENESYS_MAX_TOOLS_PER_SESSION` | Maximum data actions loaded per call (default `10`) |
+| `GENESYS_MAX_ACTION_CALLS_PER_SESSION` | Maximum data action executions per call (default `10`) |
+| `GENESYS_TOOL_OUTPUT_REDACTION_FIELDS` | Comma-separated JSON paths (for example `customer.ssn,account.cardNumber`) removed from results before the model sees them |
 
-**Note:** Some variables (like `AI_MODEL`) are available at both the environment variable level and the session variable level. If different conflicting values are configured, the Genesys session variable will always take precedence.
+Timeouts and retry settings (`GENESYS_HTTP_TIMEOUT_SECONDS`, ...) are in `config.py`.
 
-**Gemini Voice Configuration:** When using Gemini, you can set `GEMINI_VOICE` in the session variables to override the default voice independently of `AI_VOICE`. This allows you to use different voices for OpenAI and Gemini without changing `AI_VOICE`.
+## Session variables (Architect)
 
-## Function Calling for Autonomous Call Management
+Session variables are set in the **Call Audio Connector** action and override the server defaults for that call.
 
-The middleware exposes both call-control functions and optional Genesys Cloud Data Action tools to the AI model (OpenAI or Gemini). This lets the voice agent terminate calls, escalate to humans, or fetch real customer data without bespoke IVR logic.
+### Input variables (Architect → connector)
 
-### Call-Control Functions
+**Most used**
 
-#### `end_conversation_successfully`
-**When to invoke:** ONLY when BOTH conditions are met:
-1. The caller's request has been completely addressed and resolved
-2. The caller has explicitly confirmed they don't need any additional help or have no further questions
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `AI_SYSTEM_PROMPT` | Instructions for the voice agent | "You are a helpful assistant." |
+| `AI_VENDOR` | Vendor for this call: `openai`, `gemini` or `grok` (its key must be on the server) | Server `AI_VENDOR` |
+| `LANGUAGE` | Language the agent must speak. A tag such as `es-ES` also improves Grok's speech recognition | Not set |
+| `AGENT_NAME` / `COMPANY_NAME` | Names used in the prompt | Server defaults |
+| `CUSTOMER_DATA` | Personalization data as `key:value;key:value` | Not set |
+| `SUCCESS_PROMPT` | Exact words to say when the call ends successfully | A generated goodbye |
+| `ESCALATION_PROMPT` | Exact words to say before a transfer to a human | A generated transfer message |
 
-**Behavior:** The model sends a short `summary` describing what was accomplished. The function result is fed back to the AI, which then generates a farewell message to the caller.
+**Model and voice**
 
-**Custom Farewell Messages:** Use the `SUCCESS_PROMPT` input session variable to specify the exact farewell message the AI should say (e.g., "Thank you for calling Acme Corp. Have a great day!"). If not set, a default farewell will be generated.
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `OPENAI_MODEL` / `GEMINI_MODEL` / `GROK_MODEL` | Model for the vendor of this call (for example `gpt-live-1`) | Server default |
+| `OPENAI_VOICE` / `GEMINI_VOICE` / `GROK_VOICE` | Voice for the vendor of this call | Server default |
+| `AI_MODEL` / `AI_VOICE` | Used when the vendor-specific variable is empty. A model of another vendor is ignored | Server default |
+| `AI_TEMPERATURE` | Randomness of answers. Gemini only; the other vendors have no temperature setting | Model default |
+| `AI_MAX_OUTPUT_TOKENS` | Maximum tokens per answer (not supported by Grok) | `inf` |
+| `GROK_KEYTERMS` / `GROK_REASONING_EFFORT` | Grok settings for this call | Server values |
 
-Once the farewell audio completes playing, the connector waits for the audio buffer to fully drain (ensuring the caller hears the entire goodbye), then gracefully disconnects the AudioHook session with `ESCALATION_REQUIRED=false` and `COMPLETION_SUMMARY` containing the provided summary.
+**Tools**
 
-#### `end_conversation_with_escalation`
-**When to invoke:** When the caller explicitly requests a human agent, shows frustration, or the task cannot be completed.
+| Variable | Description |
+|----------|-------------|
+| `DATA_ACTION_IDS` | Genesys Data Action IDs to expose as tools, separated by `\|` |
+| `DATA_ACTION_DESCRIPTIONS` | One description per ID, same order, separated by `\|` |
+| `MCP_TOOLS_JSON` | JSON array of MCP servers / built-in tools (see [MCP servers and web search](#mcp-servers-and-web-search)) |
 
-**Behavior:** The model passes a `reason` explaining why escalation is needed. The function result is sent back to the AI, which generates a transition message to prepare the caller for the handoff.
+Older flows keep working: `OPENAI_SYSTEM_PROMPT`, `OPENAI_TEMPERATURE` and `OPENAI_MAX_OUTPUT_TOKENS` are used when the `AI_*` variable is empty, and an `OPENAI_MODEL` value is ignored when the call uses Gemini or Grok, so you can switch an existing flow to another vendor by setting `AI_VENDOR` only.
 
-**Custom Transfer Messages:** Use the `ESCALATION_PROMPT` input session variable to specify the exact transfer message the AI should say (e.g., "Let me connect you with one of our specialists who can better assist you"). If not set, a default transfer message will be generated.
+### Output variables (connector → Architect)
 
-After this message plays completely, the connector disconnects the AudioHook session with `ESCALATION_REQUIRED=true` and `ESCALATION_REASON` populated, allowing Architect to branch into a transfer queue or escalation flow.
+| Variable | Description |
+|----------|-------------|
+| `ESCALATION_REQUIRED` | `true` if the agent asked for a human agent, otherwise `false` |
+| `ESCALATION_REASON` | Why the agent escalated |
+| `COMPLETION_SUMMARY` | The agent's one-sentence summary when the call ended successfully |
+| `CONVERSATION_SUMMARY` | A 2-3 sentence summary of the whole call |
+| `CONVERSATION_DURATION` | Session length in seconds |
+| `TOTAL_INPUT_TEXT_TOKENS`, `TOTAL_INPUT_CACHED_TEXT_TOKENS`, `TOTAL_INPUT_AUDIO_TOKENS`, `TOTAL_INPUT_CACHED_AUDIO_TOKENS`, `TOTAL_OUTPUT_TEXT_TOKENS`, `TOTAL_OUTPUT_AUDIO_TOKENS` | Token usage for cost tracking |
+| `TOTAL_VOICE_SECONDS` | GPT-Live only: billed voice seconds |
 
-**Important:** Both functions ensure that:
-- All output session variables (`ESCALATION_REQUIRED`, `ESCALATION_REASON`, `COMPLETION_SUMMARY`, token metrics, etc.) are properly filled with accurate values before disconnecting
-- The complete farewell or transfer message is delivered to the caller (audio buffer fully drained)
-- The system prompt clearly instructs the AI when these functions should be invoked
+How usage is reported differs per vendor: OpenAI Realtime and Gemini give a full text / audio / cached breakdown; Grok only reports totals, which are placed in the two `*_AUDIO_TOKENS` fields; GPT-Live bills voice per second (`TOTAL_VOICE_SECONDS`) and its text token fields count the tool model and the summary.
 
-### Genesys Data Action Tools
+## Ending calls and escalating
 
-When `DATA_ACTION_IDS` are provided, the server fetches the corresponding input/success schemas from Genesys Cloud and dynamically builds function tools such as `genesys_data_action_get_account`.
+Every session includes two functions the model calls to finish the call:
 
-- Each tool mirrors the required/optional fields from the data action input schema, keeping the model honest about arguments.
-- Tool output is fed back to the model immediately so it can explain results to the caller in natural language.
-- Optional redaction paths prevent sensitive fields from ever reaching the LLM.
+| Function | When the model calls it | What happens |
+|----------|------------------------|--------------|
+| `end_conversation_successfully` | The request is solved **and** the caller confirms they need nothing else | The agent says goodbye (`SUCCESS_PROMPT` if set), then the call is disconnected with `ESCALATION_REQUIRED=false` and `COMPLETION_SUMMARY` filled |
+| `end_conversation_with_escalation` | The caller asks for a person, is clearly unhappy, or the task can't be done | The agent announces the transfer (`ESCALATION_PROMPT` if set), then the call is disconnected with `ESCALATION_REQUIRED=true` and `ESCALATION_REASON` filled |
 
-#### Configuring Data Action Session Variables
+In both cases the connector waits until the farewell has finished playing before it disconnects, and the summary is generated while the farewell plays so the caller doesn't wait. Grok speaks `SUCCESS_PROMPT` / `ESCALATION_PROMPT` word for word; the other vendors are instructed to say them exactly.
 
-Properly configuring the `DATA_ACTION_IDS` and `DATA_ACTION_DESCRIPTIONS` session variables is critical for enabling your voice agent to leverage Genesys Cloud Data Actions within its function calling toolkit. These variables work in tandem to expose specific data actions to the OpenAI Realtime model and provide the contextual information needed for the AI to understand when and how to use each tool.
+In Architect, branch on `ESCALATION_REQUIRED` after the Call Audio Connector action: transfer to a queue when it is `true`, end or wrap up the call otherwise.
 
-##### DATA_ACTION_IDS
+## Genesys Data Actions as tools
 
-This variable contains the unique identifiers of the Genesys Cloud Data Actions you want to expose to the voice agent. Format requirements:
+When `DATA_ACTION_IDS` is set, the connector reads each data action's input schema from Genesys Cloud and offers it to the model as a function (for example `genesys_data_action_get_ticket`). When the model calls it, the connector runs the data action and returns the result to the model, which explains it to the caller. If the model calls several tools at once, they run in parallel.
 
-- **Format**: Pipe-separated (`|`) list of data action IDs
-- **Structure**: Each ID follows the pattern `category_-_uuid` (e.g., `custom_-_9e9b11f4-ddfc-40d1-a7d3-d24f3815e818`)
-- **Order**: The order of IDs must exactly match the order of descriptions in `DATA_ACTION_DESCRIPTIONS`
+**Setup:**
+
+1. Create an OAuth client (client credentials) in Genesys Cloud with permission to execute the data actions, and set `GENESYS_CLIENT_ID`, `GENESYS_CLIENT_SECRET` and `GENESYS_REGION` on the server.
+2. Test each data action in Genesys Cloud first.
+3. In the Call Audio Connector action, set:
+   - `DATA_ACTION_IDS`: the action IDs separated by `|`. IDs look like `custom_-_9e9b11f4-ddfc-40d1-a7d3-d24f3815e818`.
+   - `DATA_ACTION_DESCRIPTIONS`: one description per action, **in the same order**, separated by `|`.
+
+The descriptions are what the model reads to decide when to use each tool, so explain what the action does and when to use it. To force a fixed value for an input parameter, say so in the description (the first description below does this).
 
 **Example:**
-
-```
-custom_-_9e9b11f4-ddfc-40d1-a7d3-d24f3815e818|custom_-_37be4e2a-805b-4b68-a7df-0fd2768c27b8|custom_-_e4744e9d-e3f2-4ad6-acf1-678717230e25|custom_-_ee93134c-f43e-4278-a5c3-5f98f9dcf4e1
-```
-
-##### DATA_ACTION_DESCRIPTIONS
-
-This variable provides natural language descriptions for each data action, helping the AI understand the purpose and appropriate usage context for each tool. Format requirements:
-
-- **Format**: Pipe-separated (`|`) list of descriptions
-- **Content**: Clear, concise descriptions explaining what each data action does, including key parameters and use cases
-- **Order**: Must align exactly with the order of IDs in `DATA_ACTION_IDS` (first description maps to first ID, second to second, etc.)
-- **Quality**: Well-written descriptions directly impact the AI's ability to select the right tool at the right time
-- **Input params**: In case you want to hardcode values for any of the input params to be used, just include that part in the description (as I do on my example below for the first data action)
-
-**Example:**
-
-```
-Searches knowledge base articles to address general FAQ questions, using semantic query matching with configurable confidence threshold and result limits. Use this to provide RAG responses. For the KBId input param, use dc8de859-0102-4ebd-b216-f3f31e1c78c6, for minConfidence use 0.6 and for maxArticles use 3 |Retrieves complete ticket details including customer information, journey stations, departure schedule, and fare class using ticket reference number|Checks availability for ticket modifications and returns alternative departure times and fare class options with associated change fees|Updates ticket booking with new departure date/time and fare class selections after customer confirmation
-```
-
-##### Why These Variables Are Critical
-
-1. **Tool Discovery**: The middleware uses `DATA_ACTION_IDS` to fetch the input/output schemas from Genesys Cloud at session initialization, dynamically constructing OpenAI function definitions
-
-2. **AI Decision-Making**: `DATA_ACTION_DESCRIPTIONS` are embedded in the function definitions sent to OpenAI, directly influencing when and how the model chooses to invoke each tool
-
-3. **Alignment Requirement**: Mismatched order between IDs and descriptions will cause the AI to call the wrong data actions for given scenarios, leading to failed lookups or incorrect data retrieval
-
-4. **Security Boundary**: Only data actions explicitly listed in `DATA_ACTION_IDS` are exposed to the model, providing a clear security perimeter (further enforced by the optional `GENESYS_ALLOWED_DATA_ACTION_IDS` server-side allowlist)
-
-##### Configuration Best Practices
-
-- **Test Individually**: Validate each data action works correctly in Genesys Cloud before adding it to the session variables
-- **Descriptive Clarity**: Write descriptions that explain both the what and the when—include trigger phrases customers might use
-- **Maintain Order**: Double-check that the nth ID corresponds to the nth description before deploying
-- **Iterate on Descriptions**: If the AI isn't selecting the right tool, refine the descriptions rather than modifying the data action itself
-- **Use Allowlists**: Set `GENESYS_ALLOWED_DATA_ACTION_IDS` at the environment level to prevent unauthorized data actions from being exposed even if mistakenly included in session variables
-
-##### Complete Working Example
-
-**Architect Flow Configuration:**
-
-Set these variables in your Call Audio Connector action:
 
 ```
 DATA_ACTION_IDS = custom_-_9e9b11f4-ddfc-40d1-a7d3-d24f3815e818|custom_-_37be4e2a-805b-4b68-a7df-0fd2768c27b8|custom_-_e4744e9d-e3f2-4ad6-acf1-678717230e25|custom_-_ee93134c-f43e-4278-a5c3-5f98f9dcf4e1
 
-DATA_ACTION_DESCRIPTIONS = Searches knowledge base articles to address general FAQ questions, using semantic query matching with configurable confidence threshold and result limits. Use this to provide RAG responses|Retrieves complete ticket details including customer information, journey stations, departure schedule, and fare class using ticket reference number|Checks availability for ticket modifications and returns alternative departure times and fare class options with associated change fees|Updates ticket booking with new departure date/time and fare class selections after customer confirmation
+DATA_ACTION_DESCRIPTIONS = Searches knowledge base articles to answer general FAQ questions. Use this to provide RAG responses. For the KBId input param, use dc8de859-0102-4ebd-b216-f3f31e1c78c6, for minConfidence use 0.6 and for maxArticles use 3|Retrieves complete ticket details including customer information, journey stations, departure schedule, and fare class using the ticket reference number|Checks availability for ticket modifications and returns alternative departure times and fare class options with associated change fees|Updates the ticket booking with the new departure date/time and fare class after the customer confirms
 ```
 
-**What Happens:**
+With this configuration, a caller asking "What's the baggage policy?" triggers the knowledge search, and a caller giving a ticket number triggers the ticket lookup.
 
-1. Session starts and the middleware authenticates with Genesys Cloud
-2. Four data actions are fetched and registered as OpenAI function tools: `genesys_data_action_search_knowledge`, `genesys_data_action_get_ticket`, `genesys_data_action_check_modification_options`, `genesys_data_action_update_booking`
-3. When a caller asks "What's the baggage policy?", the AI invokes `genesys_data_action_search_knowledge` with a semantic query
-4. When a caller provides a ticket reference, the AI invokes `genesys_data_action_get_ticket` to retrieve full details
-5. All tool outputs are logged, optionally redacted, and fed back to the model for natural language explanation to the caller
+**Safety controls:**
 
-### How It Works
+- Only actions listed in `DATA_ACTION_IDS` are exposed, and `GENESYS_ALLOWED_DATA_ACTION_IDS` on the server can restrict them further.
+- `GENESYS_MAX_ACTION_CALLS_PER_SESSION` and `GENESYS_MAX_TOOLS_PER_SESSION` limit usage per call.
+- `GENESYS_TOOL_OUTPUT_REDACTION_FIELDS` removes sensitive fields before the model sees them. If redaction fails, the result is withheld instead of being sent unredacted.
+- Logs contain action IDs and argument names, never argument values or results.
 
-1. **Function Detection** – OpenAI Realtime decides whether to call a Genesys data action or a call-control function based on the conversation context.
-2. **Secure Execution** – The middleware validates arguments, enforces rate limits, executes the Genesys API call (for data actions), and returns sanitized JSON results to the model.
-3. **Graceful Termination** – When a call-control function fires:
-   - Function result is sent back to OpenAI
-   - OpenAI generates a natural farewell or transition message
-   - Audio buffer drains completely, ensuring caller hears the full message
-   - Connector issues AudioHook `disconnect` with enriched output variables (`ESCALATION_REQUIRED`, `ESCALATION_REASON`, `COMPLETION_SUMMARY`)
-4. **Architect Integration** – Architect can branch on `ESCALATION_REQUIRED`, `ESCALATION_REASON`, or `COMPLETION_SUMMARY` to route calls to queues, wrap-up flows, or closure paths, while still receiving conversation summaries and token metrics.
+**If the agent picks the wrong tool**, check that IDs and descriptions are in the same order, and improve the descriptions (include the phrases callers use).
 
-### Integration Benefits
+## MCP servers and web search
 
-- **Natural Conversations** – Customers can ask for humans or end calls in their own words.
-- **Live Data Access** – Approved Genesys Data Actions are available as first-class tools without embedding credentials inside prompts.
-- **Flow-Level Insight** – New output variables expose escalation state and completion summaries for downstream routing.
-- **Governed Access** – Server-side allowlists, rate limits, and payload caps prevent runaway tool usage.
+Set the `MCP_TOOLS_JSON` session variable to a JSON array to give the agent remote [MCP](https://platform.openai.com/docs/guides/tools-remote-mcp) servers or vendor built-in tools. Leave it empty to disable. Example:
 
----
-
-## Technical Implementation Details
-
-### OpenAI Realtime API Integration
-
-When `AI_VENDOR=openai`, the connector uses the OpenAI Realtime API with the following specifications:
-
-#### Audio Format
-- **Input**: PCMU/ULAW 8kHz (from Genesys) → converted internally by OpenAI
-- **Output**: PCMU/ULAW 8kHz (to Genesys) ← converted internally by OpenAI
-- **Connection**: WebSocket at `wss://api.openai.com/v1/realtime?model={model}`
-
-#### Token Counting (OpenAI)
-Token metrics are extracted from the `usage` field in OpenAI's `response.done` events:
-```python
-usage = response.get("usage", {})
-token_details = usage.get("input_token_details", {})
-output_details = usage.get("output_token_details", {})
+```json
+[
+  {"type": "mcp", "server_label": "deepwiki", "server_url": "https://mcp.deepwiki.com/mcp", "require_approval": "never"},
+  {"type": "web_search"}
+]
 ```
 
-Metrics tracked:
-- **Input**: `text_tokens`, `audio_tokens` (with `cached_tokens_details` breakdown)
-- **Output**: `text_tokens`, `audio_tokens`
+What each vendor uses:
 
-#### Function Calling (OpenAI)
-- Uses OpenAI's structured function calling format
-- Tools are registered in `session.update` with `type: "function"`
-- Function responses sent via `conversation.item.create` with `type: "function_call_output"`
+| Vendor | Supported entries |
+|--------|-------------------|
+| OpenAI Realtime | Passed as-is: `mcp` and any built-in tool type the Realtime API accepts |
+| GPT-Live | Passed to its tool model. Approval prompts can't be answered on a phone call and are rejected, so use `"require_approval": "never"` |
+| Grok | `mcp`, `web_search`, `x_search`, `file_search` (`web_search_preview` is treated as `web_search`); other types are skipped |
+| Gemini | `web_search` / `google_search` turn on Google Search; MCP entries are skipped (not supported by Gemini Live) |
 
-#### Model Options
-- `gpt-realtime-mini` (recommended for cost-efficiency)
-- `gpt-realtime` (higher capability)
+If an MCP entry contains an `authorization` token, treat the variable as a secret. The connector never logs its contents.
 
----
+## Choosing a vendor
 
-### Google Gemini Live API Integration
+| | OpenAI Realtime | OpenAI GPT-Live | Gemini Live | xAI Grok Voice |
+|---|---|---|---|---|
+| **Telephony audio** | Native 8 kHz µ-law | Native 8 kHz µ-law | Converted from 24 kHz | Native 8 kHz µ-law |
+| **Turn taking** | Voice activity detection (semantic or silence based) | Full duplex: the model decides when to speak | Voice activity detection | Voice activity detection |
+| **Tools** | Functions, MCP, built-ins | Run by a separate tool model | Functions, Google Search | Functions, web / X / file search, MCP |
+| **Reasoning control** | `OPENAI_REASONING_EFFORT` | Tool model reasoning | `GEMINI_THINKING_LEVEL` (some models) | `GROK_REASONING_EFFORT` |
+| **Exact farewell text** | Instructed | Instructed | Instructed | Spoken word for word |
+| **Interruption handling** | Yes | Partial (see [Vendor details](#vendor-details)) | Yes | Yes |
+| **Usage metrics** | Detailed tokens | Voice seconds + tokens | Detailed tokens | Total tokens |
 
-When `AI_VENDOR=gemini`, the connector uses the Gemini Live API with the following specifications:
+Because each call can choose its vendor with the `AI_VENDOR` session variable, you can compare vendors from Architect without redeploying.
 
-#### Audio Format
-- **Input**: PCMU 8kHz (from Genesys) → resampled to PCM16 16kHz → sent to Gemini
-- **Output**: PCM16 24kHz (from Gemini) → resampled to PCM16 8kHz → encoded to PCMU → sent to Genesys
-- **Resampling**: Uses `librosa` for high-quality audio resampling
-- **Connection**: WebSocket via `google.genai.Client().aio.live.connect()`
+## Vendor details
 
-#### Token Counting (Gemini)
-Token metrics are tracked from `usage_metadata` in Gemini's response messages:
-```python
-usage_metadata = message.usage_metadata
-prompt_tokens = usage_metadata.prompt_token_count
-candidates_tokens = usage_metadata.candidates_token_count
+The xAI Voice Agent API uses the same protocol as OpenAI Realtime, so both share one WebSocket client (`openai_client.py`, with Grok differences in `grok_client.py`), and GPT-Live (`gpt_live_client.py`) reuses its transport. Gemini uses Google's official `google-genai` SDK.
+
+**OpenAI Realtime**
+
+- Connects to `wss://api.openai.com/v1/realtime?model=<model>` (GA interface).
+- Audio stays in µ-law, so no conversion is needed.
+- On an interruption the connector stops playback in Genesys and tells OpenAI how much of the answer the caller actually heard, so the conversation history stays accurate.
+- The call summary is generated as a separate text response that doesn't affect the conversation.
+
+**OpenAI GPT-Live** (used when the OpenAI model is `gpt-live-*`)
+
+- Connects to `wss://api.openai.com/v1/live/sessions`.
+- GPT-Live talks and listens at the same time and decides itself when to speak. Tools and reasoning run on a separate model (`OPENAI_LIVE_DELEGATION_MODEL`).
+- The summary is generated from the call transcript with one Responses API request (not stored by OpenAI).
+- Limitation: GPT-Live sends no interruption event, so up to about one second of already-queued audio can still play after the caller interrupts.
+
+**xAI Grok**
+
+- Connects to `wss://api.x.ai/v1/realtime?model=<model>`.
+- Audio stays in µ-law.
+- `LANGUAGE` (as a tag like `en-US`) and `GROK_KEYTERMS` improve speech recognition.
+- With `SUCCESS_PROMPT` / `ESCALATION_PROMPT` set, the farewell text is spoken exactly and can't be interrupted.
+
+**Google Gemini Live**
+
+- Uses the `google-genai` SDK. The API key travels in a request header, never in a URL.
+- Caller audio is sent at 8 kHz; the model's 24 kHz audio is converted to 8 kHz µ-law with a high-quality streaming resampler.
+- Google resets Live connections about every 10 minutes; the connector resumes the session automatically, and context compression keeps calls longer than 15 minutes working.
+- `gemini-3.8-live` runs tools in the background while it keeps talking; the call-ending functions wait for completion. Models that don't accept a setting (for example thinking level on `gemini-3.8-live`) never receive it.
+- Live models only speak, so the call summary is written by `GEMINI_SUMMARY_MODEL` from the transcript.
+
+## Testing
+
+`tests/smoke_test_vendors.py` checks the whole connector offline: it starts local mock versions of the OpenAI, GPT-Live and Grok servers, fakes the Gemini SDK session and a Genesys connection, and uses fake API keys, so it never contacts a real service.
+
+```bash
+python tests/smoke_test_vendors.py
 ```
 
-Detailed breakdown by modality via `response_tokens_details`:
-```python
-for detail in usage_metadata.response_tokens_details:
-    modality = detail.modality  # "TEXT" or "AUDIO"
-    count = detail.token_count
-```
+It covers session setup, audio in both directions, parallel tool calls, interruptions, farewells and disconnects, summaries, usage metrics, Gemini reconnection, per-call vendor selection, and the server handshake (API key check, health check, open / ping / close). Expected output ends with `7/7 passed`.
 
-Metrics tracked:
-- **Input**: Estimated from `prompt_token_count` (audio-dominant for voice)
-- **Output**: Broken down by `TEXT` and `AUDIO` modalities from `response_tokens_details`
+After deploying, make one real test call per vendor you plan to use.
 
-#### Function Calling (Gemini)
-- Uses Gemini's native function declaration format
-- Tools defined with `name`, `description`, and `parameters` (JSON Schema)
-- Function responses sent via `session.send_client_content()` with `FunctionResponse` objects
+## Troubleshooting
 
-#### Model Options
-- `gemini-2.5-flash-native-audio-preview-09-2025` (default, optimized for voice)
-- Supports native audio output with natural speech synthesis
-- Features: Affective dialogue, proactive audio, thinking capabilities
+| Symptom | What to check |
+|---------|---------------|
+| Server stops at startup with `... not found in environment variables` | The key of the default `AI_VENDOR` (or `GENESYS_API_KEY`) is not set |
+| Genesys can't connect, logs show `Invalid API Key` or `Missing 'x-api-key'` | The API key in the Genesys integration must equal `GENESYS_API_KEY` |
+| Logs show `Path mismatch` | The integration URI must end with `/audiohook` |
+| Call drops right away with `AI_VENDOR=... requested but ..._API_KEY is not configured` | The flow selected a vendor whose key is not on the server |
+| Call drops with `Failed to connect to <vendor>` | Wrong or unauthorized vendor key, or the account has no access to that model |
+| The agent never ends the call | Make the prompt clear about when the conversation is finished; the model decides when to call the end functions |
+| The agent picks the wrong Data Action | Check the order of `DATA_ACTION_IDS` / `DATA_ACTION_DESCRIPTIONS` and improve the descriptions |
+| `Data actions requested but GENESYS_CLIENT_ID / GENESYS_CLIENT_SECRET are not configured` | Set the OAuth client variables on the server |
 
-#### Voice Options
-Gemini automatically selects appropriate voices based on language. Available voices include:
-- `Kore` (default), `Puck`, `Charon`, `Aoede`, `Fenrir`, `Orbit`, and many more
+Set `DEBUG=true` temporarily for more detail, and turn it off again afterwards.
 
-See the complete list at: https://ai.google.dev/gemini-api/docs/speech-generation#voices
+## Project structure
 
----
-
-## Choosing Between OpenAI and Gemini
-
-| Feature | OpenAI Realtime API | Gemini Live API |
-|---------|---------------------|-----------------|
-| **Native Audio Processing** | Yes | Yes (with enhanced quality) |
-| **Function Calling** | ✓ | ✓ |
-| **Voice Options** | 8 voices | 6+ voices (language-adaptive) |
-| **Audio Quality** | High | High (24kHz output) |
-| **Latency** | Very Low | Very Low |
-| **Token Tracking** | Detailed breakdown | Detailed breakdown |
-| **Context Window** | Model-dependent | 128k tokens (native audio models) |
-
-**When to choose OpenAI:**
-- You need a well-established API with extensive documentation
-- You're already using OpenAI for other services
-- You prefer the specific voice characteristics of OpenAI voices
-
-**When to choose Gemini:**
-- You want Google's latest multimodal AI capabilities
-- You need advanced features like affective dialogue or thinking mode
-- You're building within the Google Cloud ecosystem
-- You want potentially lower costs with newer models
-
----
+| File | Purpose |
+|------|---------|
+| `oai_middleware.py` | Entry point: WebSocket server, `x-api-key` check, health check |
+| `audio_hook_server.py` | Genesys AudioHook protocol for one call: vendor selection, audio playback, disconnect and output variables |
+| `openai_client.py` | OpenAI Realtime client (also the base for Grok and GPT-Live) |
+| `gpt_live_client.py` | OpenAI GPT-Live client |
+| `grok_client.py` | xAI Grok Voice client |
+| `gemini_client.py` | Google Gemini Live client |
+| `voice_client_base.py` | Shared behavior: tools, farewell, playback waits, usage metrics |
+| `call_control.py` | The two call-ending functions |
+| `genesys_actions.py` | Genesys Data Actions as tools |
+| `mcp_tools.py` | Parsing of `MCP_TOOLS_JSON` |
+| `config.py` | Environment variables and defaults |
+| `utils.py` | Audio helpers, prompt building, WebSocket helpers |
+| `rate_limiter.py` | Keeps traffic to Genesys within AudioHook rate limits |
+| `tests/smoke_test_vendors.py` | Offline smoke tests |
+| `.env.local.example` | Template for your `.env` (placeholders only) |

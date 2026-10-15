@@ -1,5 +1,4 @@
 import copy
-import copy
 import json
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -37,8 +36,8 @@ def load_mcp_tool_context(raw_json: Optional[str], session_logger=None) -> Optio
     try:
         parsed = json.loads(blob)
     except json.JSONDecodeError as exc:
-        preview = (blob[:200] + "...") if len(blob) > 200 else blob
-        log.error("[MCP] Failed to parse MCP tool JSON from %s: %s (preview=%s)", source, exc, preview)
+        # No content preview: MCP entries can carry server authorization tokens.
+        log.error("[MCP] Failed to parse MCP tool JSON from %s at line %s column %s", source, exc.lineno, exc.colno)
         return None
 
     if not isinstance(parsed, list):
@@ -74,7 +73,6 @@ def load_mcp_tool_context(raw_json: Optional[str], session_logger=None) -> Optio
     instruction_lines = [
         "Remote Model Context Protocol (MCP) integrations are enabled for this conversation.",
         "When you need information or actions from these external systems, call the appropriate MCP tool instead of guessing.",
-        "Use `mcp.list_tools` if you need to inspect a server's capabilities before calling it.",
     ]
     if summaries:
         instruction_lines.append("Registered MCP endpoints:")

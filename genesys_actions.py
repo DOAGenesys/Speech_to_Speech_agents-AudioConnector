@@ -77,10 +77,8 @@ def _normalize_parameters_schema(schema: Dict[str, Any]) -> Dict[str, Any]:
     # Ensure additionalProperties is set to false for consistency with OpenAI Realtime API
     # This prevents issues where Genesys schemas might have additionalProperties: true
     base["additionalProperties"] = False
-    
-    # Always set strict to true for consistency with call control tools
-    # This ensures the model can reliably call all functions with structured outputs
-    base["strict"] = True
+    # "strict" is a tool-level flag in some vendor APIs, not a JSON Schema keyword.
+    base.pop("strict", None)
 
     if not GENESYS_TOOLS_STRICT_MODE:
         # Even without strict mode, we need consistent schema format
@@ -104,9 +102,7 @@ def _normalize_parameters_schema(schema: Dict[str, Any]) -> Dict[str, Any]:
             copy["items"] = enforce(copy["items"])
         return copy
 
-    enforced = enforce(base)
-    # strict is already set at the base level (line 82)
-    return enforced
+    return enforce(base)
 
 
 def _build_tool_description(action_id: str, schema: Dict[str, Any], custom: Optional[str]) -> str:
@@ -265,13 +261,16 @@ class GenesysActionsClient:
                     continue
                 
                 if response.status_code >= 400:
+                    # Error bodies of data actions can echo customer data, so only identifiers are logged.
                     try:
-                        error_detail = response.json()
+                        error_body = response.json()
                     except Exception:
-                        error_detail = response.text
+                        error_body = {}
+                    if not isinstance(error_body, dict):
+                        error_body = {}
                     logger.error(
-                        f"[GenesysActions] ERROR: HTTP {response.status_code} on {method} {path}. "
-                        f"Response: {error_detail}"
+                        f"[GenesysActions] ERROR: HTTP {response.status_code} on {method} {path} "
+                        f"(code={error_body.get('code')}, contextId={error_body.get('contextId')})"
                     )
                 
                 response.raise_for_status()
@@ -280,10 +279,9 @@ class GenesysActionsClient:
                     return response.json()
                 except json.JSONDecodeError as json_err:
                     logger.error(
-                        f"[GenesysActions] ERROR: Invalid JSON response from {method} {path}: {json_err}. "
-                        f"Response text: {response.text[:500]}"
+                        f"[GenesysActions] ERROR: Invalid JSON response from {method} {path} at position {json_err.pos}"
                     )
-                    raise GenesysToolError(f"Invalid JSON response from Genesys API: {str(json_err)}")
+                    raise GenesysToolError("Invalid JSON response from Genesys API")
                     
             except httpx.TimeoutException as timeout_exc:
                 last_error = timeout_exc
@@ -403,13 +401,13 @@ def _build_instruction_text(tool_summaries: List[Tuple[str, str, List[str]]]) ->
 
 
 async def build_genesys_tool_context(session_logger, input_variables: Dict[str, Any]) -> Optional[GenesysToolContext]:
-    if not GENESYS_CLIENT_ID or not GENESYS_CLIENT_SECRET:
-        session_logger.error("[GenesysTools] Genesys client credentials are missing")
-        return None
-
     raw_ids = input_variables.get("DATA_ACTION_IDS") or input_variables.get("GENESYS_DATA_ACTION_IDS")
     action_ids = _parse_action_ids(raw_ids)
     if not action_ids:
+        return None
+
+    if not GENESYS_CLIENT_ID or not GENESYS_CLIENT_SECRET:
+        session_logger.error("[GenesysTools] Data actions requested but GENESYS_CLIENT_ID / GENESYS_CLIENT_SECRET are not configured")
         return None
 
     if GENESYS_ALLOWED_DATA_ACTION_IDS:
@@ -550,12 +548,12 @@ async def build_genesys_tool_context(session_logger, input_variables: Dict[str, 
                 try:
                     redacted = _redact_payload(result_payload)
                 except Exception as redact_err:
-                    session_logger.warning(
-                        "[GenesysTools] WARNING: Redaction failed for action %s: %s. Using original payload.",
+                    session_logger.error(
+                        "[GenesysTools] ERROR: Redaction failed for action %s (%s); withholding the result from the model",
                         _action_id,
-                        redact_err
+                        type(redact_err).__name__
                     )
-                    redacted = result_payload
+                    raise GenesysToolError("The data action result could not be redacted and was withheld")
                 
                 session_logger.info(
                     "[GenesysTools] Successfully executed action %s",
