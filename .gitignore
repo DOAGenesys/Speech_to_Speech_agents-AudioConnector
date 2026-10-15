@@ -47,3 +47,7 @@ terraform.tfstate*
 .vscode/mcp.json
 local.settings.json
 *.log
+
+# Local Architect working files (exports, backups, import results)
+gc-architect-work/
+gc-architect-backups/

@@ -154,18 +154,29 @@ After the deployment finishes, copy the app URL (for example `https://your-app-x
 
 ### 2. Build the Architect flow
 
-Create an inbound call flow with a **Call Audio Connector** action that uses the integration:
+The quickest start is the example inbound call flow in this repo:
 
-<img width="504" height="769" alt="Architect flow example" src="https://github.com/user-attachments/assets/ce5efcf3-a031-41d9-9281-bcfb0e3e83f5" />
+- [`architect/DO - Audio Connector - Speech to speech_v21-0.i3InboundFlow`](architect/DO%20-%20Audio%20Connector%20-%20Speech%20to%20speech_v21-0.i3InboundFlow): import it in Architect (**Inbound Call** flows → **Import**).
+- [`architect/DO - Audio Connector - Speech to speech.yaml`](architect/DO%20-%20Audio%20Connector%20-%20Speech%20to%20speech.yaml): the same flow as Archy YAML, for Archy or the Platform API.
 
-To start faster, import the example flow in this repo (`DO - Audio Connector - OAI_v16-0.i3InboundFlow`). Then:
+The flow runs these steps in order:
 
-1. In the Call Audio Connector action, set the session variables you need, at least `AI_SYSTEM_PROMPT` (see [Session variables](#session-variables-architect)).
-2. If the agent should use Data Actions, set `DATA_ACTION_IDS` and `DATA_ACTION_DESCRIPTIONS`.
-3. Adapt the instruction and guardrail prompts in the flow (they are concatenated into the system prompt sent to the AI vendor).
-4. After the action, branch on `ESCALATION_REQUIRED` to transfer to a queue or end the call.
+| Step | What it does |
+|------|--------------|
+| **Set AI configuration** | Sets the vendor, model, voice, language and maximum answer length in one place (`Flow.aiVendor`, `Flow.aiModel`, `Flow.aiVoice`, `Flow.aiLanguage`, `Flow.aiMaxOutputTokens`). Example: `openai` / `gpt-realtime-2.1` / `coral`, or `grok` / `grok-voice-3.0` / `eve`, or `gemini` / `gemini-3.8-live` / `Kore` |
+| **Set general instructions** and **Set Guardrails** | The use-case prompt and the safety rules. They are joined into `AI_SYSTEM_PROMPT` |
+| **Call Audio Connector** | Sends the vendor-agnostic session variables (`AI_VENDOR`, `AI_MODEL`, `AI_VOICE`, `LANGUAGE`, `AI_MAX_OUTPUT_TOKENS`, prompts, persona, Data Actions) and receives every output variable |
+| **Success path** | Saves the outcome as participant data the agent can see (`AI_Summary`, `AI_CompletionSummary`, `AI_EscalationRequired`, `AI_EscalationReason`, `AI_ConversationDuration`), then transfers to a queue when `ESCALATION_REQUIRED` is `true`, otherwise disconnects |
+| **Failure path** | If the connector can't be reached or refuses the call (for example a missing vendor key), saves `AI_ConnectorErrorType` and transfers the caller to the queue instead of dropping the call |
 
-Call the flow's number: you should hear the voice agent.
+After importing, adapt it to your org:
+
+1. In **Call Audio Connector**, select your Audio Connector integration.
+2. In **Set AI configuration**, choose the vendor, model and voice. The model and voice must belong to the selected vendor, and that vendor's API key must be set on the server (see [Models and voices](#models-and-voices) for the options).
+3. Rewrite the instructions and guardrails for your use case, and set `AGENT_NAME`, `COMPANY_NAME`, `SUCCESS_PROMPT` and `ESCALATION_PROMPT`.
+4. Replace `DATA_ACTION_IDS` and `DATA_ACTION_DESCRIPTIONS` with your own Data Actions (the example IDs only exist in the author's org), or remove them.
+5. In the **Transfer to agent** task, select your queue (the example uses `DO_test`).
+6. Publish, assign the flow to a phone number, and call it: you should hear the voice agent.
 
 ## Environment variables
 
@@ -258,9 +269,9 @@ Session variables are set in the **Call Audio Connector** action and override th
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `OPENAI_MODEL` / `GEMINI_MODEL` / `GROK_MODEL` | Model for the vendor of this call (for example `gpt-live-1`) | Server default |
-| `OPENAI_VOICE` / `GEMINI_VOICE` / `GROK_VOICE` | Voice for the vendor of this call | Server default |
-| `AI_MODEL` / `AI_VOICE` | Used when the vendor-specific variable is empty. A model of another vendor is ignored | Server default |
+| `AI_MODEL` | Model for this call, for any vendor (for example `gpt-realtime-2.1`, `gpt-live-1`, `gemini-3.8-live`, `grok-voice-3.0`). A model of another vendor is ignored | Server default |
+| `AI_VOICE` | Voice for this call, for any vendor (for example `coral`, `Kore`, `eve`). An unknown Gemini voice falls back to the default | Server default |
+| `OPENAI_MODEL` / `GEMINI_MODEL` / `GROK_MODEL`, `OPENAI_VOICE` / `GEMINI_VOICE` / `GROK_VOICE` | Vendor-specific alternatives. When set, they take precedence over `AI_MODEL` / `AI_VOICE` for that vendor | Server default |
 | `AI_TEMPERATURE` | Randomness of answers. Gemini only; the other vendors have no temperature setting | Model default |
 | `AI_MAX_OUTPUT_TOKENS` | Maximum tokens per answer (not supported by Grok) | `inf` |
 | `GROK_KEYTERMS` / `GROK_REASONING_EFFORT` | Grok settings for this call | Server values |
@@ -449,4 +460,5 @@ Set `DEBUG=true` temporarily for more detail, and turn it off again afterwards.
 | `utils.py` | Audio helpers, prompt building, WebSocket helpers |
 | `rate_limiter.py` | Keeps traffic to Genesys within AudioHook rate limits |
 | `tests/smoke_test_vendors.py` | Offline smoke tests |
+| `architect/` | Example Architect inbound call flow (Architect export and Archy YAML) |
 | `.env.local.example` | Template for your `.env` (placeholders only) |
