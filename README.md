@@ -238,7 +238,7 @@ Needed only when the voice agent calls Genesys Cloud Data Actions:
 | Variable | Description |
 |----------|-------------|
 | `GENESYS_CLIENT_ID` / `GENESYS_CLIENT_SECRET` | OAuth client credentials (client credentials grant) allowed to run the data actions |
-| `GENESYS_REGION` or `GENESYS_BASE_URL` | Your region (for example `mypurecloud.com`, `usw2.pure.cloud`) or the full API base URL |
+| `GENESYS_REGION` or `GENESYS_BASE_URL` | Your org's domain (for example `mypurecloud.de`, `euw2.pure.cloud`) or region name (`eu-central-1`), or the full API base URL |
 | `GENESYS_LOGIN_URL` | Override for the OAuth login URL (default `https://login.<region>`) |
 | `GENESYS_ALLOWED_DATA_ACTION_IDS` | Comma-separated allowlist. Only these actions can be exposed, whatever the flow requests |
 | `GENESYS_MAX_TOOLS_PER_SESSION` | Maximum data actions loaded per call (default `10`) |

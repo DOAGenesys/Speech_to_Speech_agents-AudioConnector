@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import json
+import re
 import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
@@ -31,24 +32,46 @@ class GenesysToolError(Exception):
     """Raised when a Genesys data action cannot be prepared or executed."""
 
 
+_GENESYS_REGION_DOMAINS = {
+    "us_east_1": "mypurecloud.com",
+    "us_west_2": "usw2.pure.cloud",
+    "ca_central_1": "cac1.pure.cloud",
+    "sa_east_1": "sae1.pure.cloud",
+    "eu_central_1": "mypurecloud.de",
+    "eu_central_2": "euc2.pure.cloud",
+    "eu_west_1": "mypurecloud.ie",
+    "eu_west_2": "euw2.pure.cloud",
+    "me_central_1": "mec1.pure.cloud",
+    "ap_south_1": "aps1.pure.cloud",
+    "ap_northeast_1": "mypurecloud.jp",
+    "ap_northeast_2": "apne2.pure.cloud",
+    "ap_northeast_3": "apne3.pure.cloud",
+    "ap_southeast_2": "mypurecloud.com.au",
+}
+
+
+def _genesys_region_domain() -> str:
+    """Accept a domain (``mypurecloud.de``, ``euw2.pure.cloud``) or an AWS-style name (``eu-central-1``)."""
+    region = (GENESYS_REGION or "").strip().lower()
+    if not region:
+        return "mypurecloud.com"
+    region = re.sub(r"^https?://", "", region).rstrip("/")
+    region = re.sub(r"^(api|login)\.", "", region)
+    if "." in region:
+        return region
+    return _GENESYS_REGION_DOMAINS.get(region.replace("-", "_"), f"{region}.mypurecloud.com")
+
+
 def _derive_api_base_url() -> str:
     if GENESYS_BASE_URL:
         return GENESYS_BASE_URL.rstrip('/')
-    if GENESYS_REGION:
-        if 'mypurecloud.com' in GENESYS_REGION or 'mypurecloud.de' in GENESYS_REGION:
-            return f"https://api.{GENESYS_REGION}"
-        return f"https://api.{GENESYS_REGION}.mypurecloud.com"
-    return "https://api.mypurecloud.com"
+    return f"https://api.{_genesys_region_domain()}"
 
 
 def _derive_login_url() -> str:
     if GENESYS_LOGIN_URL:
         return GENESYS_LOGIN_URL.rstrip('/')
-    if GENESYS_REGION:
-        if 'mypurecloud.com' in GENESYS_REGION or 'mypurecloud.de' in GENESYS_REGION:
-            return f"https://login.{GENESYS_REGION}"
-        return f"https://login.{GENESYS_REGION}.mypurecloud.com"
-    return "https://login.mypurecloud.com"
+    return f"https://login.{_genesys_region_domain()}"
 
 
 def _sanitize_function_name(action_id: str) -> str:
